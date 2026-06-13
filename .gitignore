@@ -1,0 +1,14 @@
+
+# local envs
+.conda-env/
+.venv/
+
+# runtime outputs
+results/
+log/
+backstop.log
+empty_response_debug.jsonl
+max_workers_control.txt
+
+# local config
+.env
