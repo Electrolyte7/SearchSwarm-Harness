@@ -1267,7 +1267,14 @@ class MultiTurnReactAgent(FnCallAgent):
 
     def custom_call_tool(self, tool_name: str, tool_args: dict, **kwargs):
         if tool_name in TOOL_MAP:
-            tool_args["params"] = tool_args
+            # Some OpenAI-compatible models wrap the declared arguments in a
+            # single `params` object. Accept that equivalent shape without
+            # weakening validation for genuinely malformed tool calls.
+            if (
+                set(tool_args) == {"params"}
+                and isinstance(tool_args["params"], dict)
+            ):
+                tool_args = dict(tool_args["params"])
             raw_result = TOOL_MAP[tool_name].call(tool_args, **kwargs)
             return raw_result
         else:

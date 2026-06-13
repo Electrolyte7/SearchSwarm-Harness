@@ -16,10 +16,40 @@ if [ ! -f "$ENV_FILE" ]; then
     exit 1
 fi
 
+# Preserve explicit run-specific overrides supplied by wrapper scripts. Sourcing
+# .env normally overwrites exported variables, which would make variants such
+# as ENABLE_SUB_AGENT=0/1 ineffective.
+OVERRIDE_NAMES=(
+    DATASET OUTPUT_PATH EXPERIMENT_NAME ROLLOUT_COUNT MAX_WORKERS
+    TEMPERATURE TOP_P PRESENCE_PENALTY ENABLE_SUB_AGENT TOOL_TYPE SEARCH_MODE
+    RUN_TIMEOUT_MINUTES SUB_AGENT_TIMEOUT_MINUTES
+)
+declare -A RUN_OVERRIDES=()
+for name in "${OVERRIDE_NAMES[@]}"; do
+    if [[ -v "$name" ]]; then
+        RUN_OVERRIDES["$name"]="${!name}"
+    fi
+done
+
 echo "Loading environment from $ENV_FILE ..."
 set -a            # export everything sourced below
 source "$ENV_FILE"
 set +a
+
+for name in "${!RUN_OVERRIDES[@]}"; do
+    printf -v "$name" '%s' "${RUN_OVERRIDES[$name]}"
+    export "$name"
+done
+
+# Allow run-specific values to live in wrapper scripts instead of .env.
+: "${DATASET:=eval_data/example/standardized_data.jsonl}"
+: "${OUTPUT_PATH:=./results}"
+: "${EXPERIMENT_NAME:=}"
+: "${ROLLOUT_COUNT:=1}"
+: "${MAX_WORKERS:=1}"
+: "${TEMPERATURE:=0.7}"
+: "${TOP_P:=0.95}"
+: "${PRESENCE_PENALTY:=1.1}"
 
 cd "$SCRIPT_DIR"
 

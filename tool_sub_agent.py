@@ -305,7 +305,11 @@ class SubAgent:
 
         if tool_name in self._tool_map:
             args_copy = dict(tool_args)
-            args_copy["params"] = args_copy
+            if (
+                set(args_copy) == {"params"}
+                and isinstance(args_copy["params"], dict)
+            ):
+                args_copy = dict(args_copy["params"])
             return self._tool_map[tool_name].call(args_copy)
         return f"Error: Tool '{tool_name}' not available. Available: {list(self._tool_map.keys())}"
 

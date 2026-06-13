@@ -1,6 +1,10 @@
 json5
+datasets
+huggingface-hub
 numpy
 openai
+pandas
+pyarrow
 qwen-agent
 requests
 scipy

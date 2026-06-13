@@ -2,6 +2,8 @@
 # local envs
 .conda-env/
 .venv/
+__pycache__/
+*.py[cod]
 
 # runtime outputs
 results/
@@ -12,3 +14,11 @@ max_workers_control.txt
 
 # local config
 .env
+
+# Locally decrypted benchmark material (upstream canaries prohibit publishing
+# plaintext; keep only preparation code, documentation, and hand-authored QA).
+eval_data/benchmark/.cache/
+eval_data/benchmark/browsecomp_subset_20.jsonl
+eval_data/benchmark/gaia_subset_20.jsonl
+eval_data/benchmark/xbench_deepsearch_subset_20.jsonl
+eval_data/benchmark/all_80.jsonl
