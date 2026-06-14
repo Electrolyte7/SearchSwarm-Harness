@@ -52,11 +52,24 @@ done
 
 if [[ "$SETTING" == "single" ]]; then
     ENABLE_SUB_AGENT_VALUE=0
+    REQUIRE_SUB_AGENT_CALL_VALUE=0
 else
     ENABLE_SUB_AGENT_VALUE=1
+    if [[ -n "${BENCHMARK_REQUIRE_SUB_AGENT_CALL+x}" ]]; then
+        REQUIRE_SUB_AGENT_CALL_VALUE="$BENCHMARK_REQUIRE_SUB_AGENT_CALL"
+    elif [[ "$MAX_SAMPLES" -eq 1 ]]; then
+        REQUIRE_SUB_AGENT_CALL_VALUE=1
+    else
+        REQUIRE_SUB_AGENT_CALL_VALUE=0
+    fi
     if [[ -z "${SUB_AGENT_MODEL:-}" ]]; then
         export SUB_AGENT_MODEL="$MODEL_PATH"
     fi
+fi
+if [[ "$REQUIRE_SUB_AGENT_CALL_VALUE" != "0" \
+      && "$REQUIRE_SUB_AGENT_CALL_VALUE" != "1" ]]; then
+    echo "Error: BENCHMARK_REQUIRE_SUB_AGENT_CALL must be 0 or 1." >&2
+    exit 2
 fi
 
 RUN_ID="${BENCHMARK_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
@@ -75,12 +88,14 @@ export DATASET="$DATASET_PATH"
 export OUTPUT_PATH="$RUN_ROOT"
 export EXPERIMENT_NAME="$EXPERIMENT_NAME_VALUE"
 export ENABLE_SUB_AGENT="$ENABLE_SUB_AGENT_VALUE"
+export REQUIRE_SUB_AGENT_CALL="$REQUIRE_SUB_AGENT_CALL_VALUE"
 export TOOL_TYPE="${BENCHMARK_TOOL_TYPE:-four}"
 export SEARCH_MODE="${BENCHMARK_SEARCH_MODE:-multi}"
 export ROLLOUT_COUNT=1
 export MAX_WORKERS=1
 export RUN_TIMEOUT_MINUTES="${BENCHMARK_TIMEOUT_MINUTES:-10}"
 export SUB_AGENT_TIMEOUT_MINUTES="${BENCHMARK_TIMEOUT_MINUTES:-10}"
+export MAX_TOOL_FORMAT_RETRIES="${BENCHMARK_MAX_TOOL_FORMAT_RETRIES:-3}"
 
 JUDGE_ENABLED="${BENCHMARK_JUDGE_ENABLED:-0}"
 WALL_TIMEOUT_MINUTES="$((RUN_TIMEOUT_MINUTES + 2))"
@@ -92,6 +107,7 @@ dataset: $DATASET_PATH
 dataset_name: $DATASET_NAME
 setting: $SETTING
 sub_agent_enabled: $ENABLE_SUB_AGENT
+require_sub_agent_call: $REQUIRE_SUB_AGENT_CALL
 model: $MODEL_PATH
 sub_agent_model: ${SUB_AGENT_MODEL:-n/a}
 tools: $TOOL_TYPE ($SEARCH_MODE search)
@@ -111,13 +127,15 @@ import sys
 
 keys = [
     "DATASET", "OUTPUT_PATH", "EXPERIMENT_NAME", "ENABLE_SUB_AGENT",
+    "REQUIRE_SUB_AGENT_CALL",
     "MODEL_MODE", "MODEL_PATH", "SUB_AGENT_MODE", "SUB_AGENT_MODEL",
     "JUDGE_MODEL_MODE", "JUDGE_MODEL_NAME", "TOOL_TYPE", "SEARCH_MODE",
     "SEARCH_NUM_RESULTS", "ROLLOUT_COUNT", "MAX_WORKERS",
     "MAX_LLM_CALL_PER_RUN", "MAX_CONTEXT_TOKENS", "MAX_GENERATION_TOKENS",
     "RUN_TIMEOUT_MINUTES", "SUB_AGENT_MAX_LLM_CALLS",
-    "SUB_AGENT_TIMEOUT_MINUTES", "TEMPERATURE", "TOP_P",
-    "PRESENCE_PENALTY",
+    "SUB_AGENT_TIMEOUT_MINUTES", "SUB_AGENT_FORCE_ANSWER_ATTEMPTS",
+    "TEMPERATURE", "TOP_P",
+    "PRESENCE_PENALTY", "MAX_TOOL_FORMAT_RETRIES",
 ]
 config = {key: os.environ.get(key) for key in keys}
 config["judge_enabled"] = os.environ.get("BENCHMARK_JUDGE_ENABLED", "0") == "1"
@@ -134,7 +152,30 @@ set -e
 END_EPOCH="$(date +%s)"
 ELAPSED_SECONDS="$((END_EPOCH - START_EPOCH))"
 
-python - "$RUN_ROOT/run_status.json" "$RUN_STATUS" "$ELAPSED_SECONDS" "$RESULT_DIR" <<'PY'
+RESULT_FILE="$RESULT_DIR/iter1.jsonl"
+TRAJECTORY_FILE="$RESULT_DIR/subagent_trajectories.jsonl"
+VALIDATION_STATUS=0
+if [[ "$RUN_STATUS" -eq 0 ]]; then
+    set +e
+    VALIDATION_ARGS=(
+        --result "$RESULT_FILE"
+        --trajectory "$TRAJECTORY_FILE"
+        --setting "$SETTING"
+    )
+    if [[ "$REQUIRE_SUB_AGENT_CALL" == "1" ]]; then
+        VALIDATION_ARGS+=(--require-sub-agent)
+    fi
+    python "$SCRIPT_DIR/scripts/validate_smoke_run.py" \
+        "${VALIDATION_ARGS[@]}"
+    VALIDATION_STATUS=$?
+    set -e
+    if [[ "$VALIDATION_STATUS" -ne 0 ]]; then
+        RUN_STATUS=65
+    fi
+fi
+
+python - "$RUN_ROOT/run_status.json" "$RUN_STATUS" "$ELAPSED_SECONDS" \
+    "$RESULT_DIR" "$VALIDATION_STATUS" <<'PY'
 import json
 import os
 import sys
@@ -145,6 +186,7 @@ payload = {
     "exit_code": status_code,
     "elapsed_seconds": int(sys.argv[3]),
     "timed_out": status_code in (124, 137),
+    "validation_exit_code": int(sys.argv[5]),
     "result_dir": result_dir,
     "result_file": os.path.join(result_dir, "iter1.jsonl"),
     "subagent_trajectory_file": os.path.join(
@@ -157,6 +199,7 @@ PY
 
 echo "elapsed_seconds: $ELAPSED_SECONDS"
 echo "exit_code: $RUN_STATUS"
-echo "result_file: $RESULT_DIR/iter1.jsonl"
-echo "subagent_trajectory_file: $RESULT_DIR/subagent_trajectories.jsonl"
+echo "validation_exit_code: $VALIDATION_STATUS"
+echo "result_file: $RESULT_FILE"
+echo "subagent_trajectory_file: $TRAJECTORY_FILE"
 exit "$RUN_STATUS"

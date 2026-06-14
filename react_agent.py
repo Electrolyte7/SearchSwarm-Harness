@@ -18,6 +18,7 @@ from prompt import *
 
 from hermes_w_py_parser import parse_tool_call_blocks
 import main_checkpoint as _main_ckpt
+from tool_call_utils import normalize_tool_args
 from tool_search import *
 from tool_visit import *
 
@@ -38,6 +39,7 @@ RUN_TIMEOUT_MINUTES = int(os.getenv('RUN_TIMEOUT_MINUTES', 150))
 MAX_CONTEXT_TOKENS = int(os.getenv('MAX_CONTEXT_TOKENS', 128 * 1024))
 MAX_GENERATION_TOKENS = int(os.getenv('MAX_GENERATION_TOKENS', 8192))
 TOKEN_COUNTER = os.getenv('TOKEN_COUNTER', 'local')
+MAX_TOOL_FORMAT_RETRIES = int(os.getenv('MAX_TOOL_FORMAT_RETRIES', 3))
 
 _empty_resp_lock = threading.Lock()
 _empty_resp_count = 0
@@ -733,10 +735,10 @@ class MultiTurnReactAgent(FnCallAgent):
                         results.append(result)
                 except ToolCallFormatError as e:
                     format_retry_count += 1
-                    if format_retry_count < 128:
+                    if format_retry_count <= MAX_TOOL_FORMAT_RETRIES:
                         sleep_time = min(1 * (2 ** (format_retry_count - 1)) + random.uniform(0, 1), 30)
                         print(f"[Format Retry] Tool call format error: {e}. "
-                              f"Retry {format_retry_count}/128, sleeping {sleep_time:.2f}s...")
+                              f"Retry {format_retry_count}/{MAX_TOOL_FORMAT_RETRIES}, sleeping {sleep_time:.2f}s...")
                         time.sleep(sleep_time)
                         messages = messages_before_round
                         round_num -= 1
@@ -747,7 +749,7 @@ class MultiTurnReactAgent(FnCallAgent):
                             start_time)
                         format_error_rollback = True
                     else:
-                        print(f"[Format Retry] All 128 retries exhausted. Using error message.")
+                        print(f"[Format Retry] All {MAX_TOOL_FORMAT_RETRIES} retries exhausted. Using error message.")
                         results.append(str(e))
                         format_retry_count = 0
 
@@ -898,10 +900,10 @@ class MultiTurnReactAgent(FnCallAgent):
                         results.append(one)
                 except ToolCallFormatError as e:
                     format_retry_count += 1
-                    if format_retry_count < 128:
+                    if format_retry_count <= MAX_TOOL_FORMAT_RETRIES:
                         sleep_time = min(1 * (2 ** (format_retry_count - 1)) + random.uniform(0, 1), 30)
                         print(f"[Format Retry] Tool call format error: {e}. "
-                              f"Retry {format_retry_count}/128, sleeping {sleep_time:.2f}s...")
+                              f"Retry {format_retry_count}/{MAX_TOOL_FORMAT_RETRIES}, sleeping {sleep_time:.2f}s...")
                         time.sleep(sleep_time)
                         messages = messages_before_round
                         round_num -= 1
@@ -912,7 +914,7 @@ class MultiTurnReactAgent(FnCallAgent):
                             start_time)
                         format_error_rollback = True
                     else:
-                        print(f"[Format Retry] All 128 retries exhausted. Using error message.")
+                        print(f"[Format Retry] All {MAX_TOOL_FORMAT_RETRIES} retries exhausted. Using error message.")
                         results.append(str(e))
                         format_retry_count = 0
 
@@ -1164,10 +1166,10 @@ class MultiTurnReactAgent(FnCallAgent):
                                                        question=question)
                     except ToolCallFormatError as e:
                         format_retry_count += 1
-                        if format_retry_count < 128:
+                        if format_retry_count <= MAX_TOOL_FORMAT_RETRIES:
                             sleep_time = min(1 * (2 ** (format_retry_count - 1)) + random.uniform(0, 1), 30)
                             print(f"[Format Retry] Tool call format error for '{tool_name}': {e}. "
-                                  f"Retry {format_retry_count}/128, sleeping {sleep_time:.2f}s...")
+                                  f"Retry {format_retry_count}/{MAX_TOOL_FORMAT_RETRIES}, sleeping {sleep_time:.2f}s...")
                             time.sleep(sleep_time)
                             messages = messages_before_round
                             round_num -= 1
@@ -1179,7 +1181,7 @@ class MultiTurnReactAgent(FnCallAgent):
                             format_error_in_round = True
                             break
                         else:
-                            print(f"[Format Retry] All 128 retries exhausted for '{tool_name}'. Using error message.")
+                            print(f"[Format Retry] All {MAX_TOOL_FORMAT_RETRIES} retries exhausted for '{tool_name}'. Using error message.")
                             result = str(e)
                             format_retry_count = 0
                     except Exception as e:
@@ -1191,6 +1193,37 @@ class MultiTurnReactAgent(FnCallAgent):
                 continue
 
             format_retry_count = 0
+
+            if use_api_token_counter and num_llm_calls_available <= 1:
+                print(
+                    "LLM call limit approaching: "
+                    f"{num_llm_calls_available} calls remaining. "
+                    "Forcing final answer."
+                )
+                if messages[-1]["role"] in ("user", "tool"):
+                    messages.append(self._make_assistant_msg(
+                        "Let me provide my final answer based on all information gathered.",
+                        reasoning="LLM call limit approaching, consolidating information to provide final answer.",
+                    ))
+                messages.append({"role": "user", "content": force_answer_prompt})
+                content, _, _, reasoning, _ = self.call_api(
+                    messages,
+                    max_tokens=MAX_GENERATION_TOKENS,
+                    use_tools=False,
+                )
+                messages.append(self._make_assistant_msg(
+                    (content or "").strip(), reasoning=reasoning))
+                final_text = content or reasoning or ""
+                if '<answer>' in final_text and '</answer>' in final_text:
+                    prediction = final_text.split('<answer>')[1].split('</answer>')[0]
+                    termination = 'generate an answer as llm call limit reached'
+                else:
+                    prediction = final_text
+                    termination = 'forced answer, no answer tag (llm call limit)'
+                return finish(
+                    prediction, termination, "forced_llm_call_limit",
+                    messages, round_num, num_llm_calls_available,
+                    format_retry_count, start_time)
 
             if not use_api_token_counter:
                 need_force_answer = False
@@ -1267,14 +1300,7 @@ class MultiTurnReactAgent(FnCallAgent):
 
     def custom_call_tool(self, tool_name: str, tool_args: dict, **kwargs):
         if tool_name in TOOL_MAP:
-            # Some OpenAI-compatible models wrap the declared arguments in a
-            # single `params` object. Accept that equivalent shape without
-            # weakening validation for genuinely malformed tool calls.
-            if (
-                set(tool_args) == {"params"}
-                and isinstance(tool_args["params"], dict)
-            ):
-                tool_args = dict(tool_args["params"])
+            tool_args = normalize_tool_args(tool_args)
             raw_result = TOOL_MAP[tool_name].call(tool_args, **kwargs)
             return raw_result
         else:

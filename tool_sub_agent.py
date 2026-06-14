@@ -13,6 +13,7 @@ Supports four mode combinations via environment variables:
 import json
 import json5
 import os
+import re
 import time
 import random
 import datetime
@@ -34,6 +35,7 @@ from openai import (
 from qwen_agent.tools.base import BaseTool, register_tool
 
 from hermes_w_py_parser import parse_tool_call_blocks
+from tool_call_utils import normalize_tool_args
 from prompt import (
     SUB_AGENT_OPENAI_TOOLS,
     render_sub_agent_system_prompt,
@@ -52,6 +54,8 @@ SUB_AGENT_TIMEOUT_MINUTES = int(os.getenv('SUB_AGENT_TIMEOUT_MINUTES', 30))
 SUB_AGENT_TEMPERATURE = float(os.getenv('SUB_AGENT_TEMPERATURE', '0.85'))
 SUB_AGENT_TOP_P = float(os.getenv('SUB_AGENT_TOP_P', '0.95'))
 SUB_AGENT_PRESENCE_PENALTY = float(os.getenv('SUB_AGENT_PRESENCE_PENALTY', '1.1'))
+SUB_AGENT_FORCE_ANSWER_ATTEMPTS = int(
+    os.getenv('SUB_AGENT_FORCE_ANSWER_ATTEMPTS', 2))
 TEMPLATE = os.getenv('TEMPLATE', 'qwen3')
 
 def _parse_endpoints(spec: str):
@@ -152,11 +156,100 @@ FORCE_ANSWER_PROMPT = (
 # sub-agent's status as 'error' rather than 'completed'.
 _LLM_FAILURE_SENTINEL = "LLM call failed after all retries."
 _NO_REPORT_SENTINEL = "(Sub-agent returned no usable content.)"
+_FALLBACK_PREFIX = (
+    "[Fallback report: the sub-agent did not emit the required <report> "
+    "format. The text below is recovered from its existing evidence.]"
+)
+_DSML_TOOL_CALL_RE = re.compile(
+    r"<(?:\|｜){2}DSML(?:\|｜){2}(?:tool_calls|invoke|parameter)\b",
+    re.IGNORECASE,
+)
+_XML_TOOL_CALL_RE = re.compile(
+    r"<\s*(?:tool_call|tool_calls|invoke)\b",
+    re.IGNORECASE,
+)
+_ACTION_INTENT_RE = re.compile(
+    r"\b(?:let me|i (?:should|need to|will|can)|next,? i|"
+    r"i(?:'ll| will) try|trying another|try (?:a|another) "
+    r"different approach)\b",
+    re.IGNORECASE,
+)
 
 
 def _extract_report_or_sentinel(text):
     if text and '<report>' in text and '</report>' in text:
         return text.split('<report>', 1)[1].split('</report>', 1)[0].strip()
+    return _NO_REPORT_SENTINEL
+
+
+def _contains_text_tool_call(text):
+    """Return whether a no-tools response still encodes a tool invocation."""
+    if not text:
+        return False
+    return bool(
+        _DSML_TOOL_CALL_RE.search(text)
+        or _XML_TOOL_CALL_RE.search(text)
+        or "</tool_call>" in text.lower()
+        or "DSML" in text and "tool_calls" in text
+    )
+
+
+def _usable_fallback_text(text):
+    if not isinstance(text, str):
+        return ""
+    candidate = text.strip()
+    if (
+        not candidate
+        or candidate in (_NO_REPORT_SENTINEL, _LLM_FAILURE_SENTINEL)
+        or _contains_text_tool_call(candidate)
+        or _ACTION_INTENT_RE.search(candidate)
+    ):
+        return ""
+    lowered = candidate.lower()
+    if (
+        candidate.startswith("stdout:")
+        and "evidence in page:" not in lowered
+        and "summary:" not in lowered
+        and any(marker in lowered for marker in (
+            "empty response",
+            "empty -",
+            "length: 0",
+            "no english tracks found",
+            "error:",
+            "traceback",
+        ))
+    ):
+        return ""
+    return candidate
+
+
+def _fallback_report(messages, candidates=()):
+    """Recover an auditable report from generated text or gathered evidence."""
+    for candidate in candidates:
+        usable = _usable_fallback_text(candidate)
+        if usable:
+            return f"{_FALLBACK_PREFIX}\n\n{usable}"
+
+    for role, stdout_mode in (
+        ("tool", "exclude"),
+        ("tool", "only"),
+        ("assistant", "any"),
+    ):
+        for message in reversed(messages or []):
+            if message.get("role") != role:
+                continue
+            for key in ("content", "reasoning_content"):
+                usable = _usable_fallback_text(message.get(key))
+                if not usable:
+                    continue
+                is_stdout = usable.startswith("stdout:")
+                if stdout_mode == "exclude" and is_stdout:
+                    continue
+                if stdout_mode == "only" and not is_stdout:
+                    continue
+                if len(usable) > 6000:
+                    usable = usable[:6000].rstrip() + "\n[Evidence truncated.]"
+                return f"{_FALLBACK_PREFIX}\n\n{usable}"
     return _NO_REPORT_SENTINEL
 
 
@@ -304,12 +397,7 @@ class SubAgent:
             return self._tool_map[tool_name].call(code)
 
         if tool_name in self._tool_map:
-            args_copy = dict(tool_args)
-            if (
-                set(args_copy) == {"params"}
-                and isinstance(args_copy["params"], dict)
-            ):
-                args_copy = dict(args_copy["params"])
+            args_copy = normalize_tool_args(tool_args)
             return self._tool_map[tool_name].call(args_copy)
         return f"Error: Tool '{tool_name}' not available. Available: {list(self._tool_map.keys())}"
 
@@ -665,17 +753,48 @@ class SubAgent:
                 print(f"[SubAgent] Force-answer count_messages_tokens failed: "
                       f"{type(e).__name__}: {e}. Using default max_tokens.")
 
-        content, _, _, reasoning, _ = self._call_llm_structured(
-            client, model, messages, use_tools=False, is_api=is_api,
-            max_tokens=max_tokens)
-        self._llm_calls_used += 1
-        messages.append(self._make_assistant_msg(content, reasoning=reasoning))
-        final = content or reasoning or ""
-        report = _extract_report_or_sentinel(final)
-        if report == _NO_REPORT_SENTINEL:
+        fallback_candidates = []
+        attempts = max(1, SUB_AGENT_FORCE_ANSWER_ATTEMPTS)
+        for attempt in range(attempts):
+            content, _, _, reasoning, finish_reason = self._call_llm_structured(
+                client, model, messages, use_tools=False, is_api=is_api,
+                max_tokens=max_tokens)
+            self._llm_calls_used += 1
+            messages.append(self._make_assistant_msg(
+                content, reasoning=reasoning))
+
+            final = content or reasoning or ""
+            report = _extract_report_or_sentinel(final)
+            if report != _NO_REPORT_SENTINEL:
+                return self._parse_result(
+                    report, messages=messages, status=status)
+
+            fallback_candidates.extend((content, reasoning))
+            if finish_reason == "exhausted":
+                break
+            if _contains_text_tool_call(final) and attempt < attempts - 1:
+                print(
+                    "[SubAgent] Force answer emitted a text-encoded tool call; "
+                    "retrying with tools explicitly disabled."
+                )
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Tool execution is disabled. Do not emit DSML, XML, "
+                        "<tool_call>, code, or another action. Using only the "
+                        "evidence already present, return one final "
+                        "<report>...</report> block now."
+                    ),
+                })
+                continue
+            break
+
+        fallback = _fallback_report(messages, fallback_candidates)
+        if fallback == _NO_REPORT_SENTINEL:
             return self._parse_result(
-                _NO_REPORT_SENTINEL, messages=messages, status='error')
-        return self._parse_result(report, messages=messages, status=status)
+                fallback, messages=messages, status='error')
+        return self._parse_result(
+            fallback, messages=messages, status=f"{status}_fallback")
 
     # =================================================================
     # XML tool-calling loop (local qwen3-style XML). One assistant turn may
@@ -806,16 +925,46 @@ class SubAgent:
             print(f"[SubAgent] Force-answer count_messages_tokens failed: "
                   f"{type(e).__name__}: {e}. Using default max_tokens.")
 
-        content, _ = self._call_llm_xml(client, model, messages, max_tokens=max_tokens)
-        self._llm_calls_used += 1
-        messages.append({"role": "assistant", "content": content.strip() if content else ""})
-        if content == _LLM_FAILURE_SENTINEL:
-            return self._parse_result(content, messages=messages, status='error')
-        report = _extract_report_or_sentinel(content or "")
-        if report == _NO_REPORT_SENTINEL:
+        fallback_candidates = []
+        attempts = max(1, SUB_AGENT_FORCE_ANSWER_ATTEMPTS)
+        for attempt in range(attempts):
+            content, _ = self._call_llm_xml(
+                client, model, messages, max_tokens=max_tokens)
+            self._llm_calls_used += 1
+            messages.append({
+                "role": "assistant",
+                "content": content.strip() if content else "",
+            })
+
+            if content == _LLM_FAILURE_SENTINEL:
+                break
+            report = _extract_report_or_sentinel(content or "")
+            if report != _NO_REPORT_SENTINEL:
+                return self._parse_result(
+                    report, messages=messages, status=status)
+
+            fallback_candidates.append(content)
+            if _contains_text_tool_call(content) and attempt < attempts - 1:
+                print(
+                    "[SubAgent] Force answer emitted a text-encoded tool call; "
+                    "retrying with tools explicitly disabled."
+                )
+                _append_user_prompt(
+                    messages,
+                    "Tool execution is disabled. Do not emit DSML, XML, "
+                    "<tool_call>, code, or another action. Using only the "
+                    "evidence already present, return one final "
+                    "<report>...</report> block now.",
+                )
+                continue
+            break
+
+        fallback = _fallback_report(messages, fallback_candidates)
+        if fallback == _NO_REPORT_SENTINEL:
             return self._parse_result(
-                _NO_REPORT_SENTINEL, messages=messages, status='error')
-        return self._parse_result(report, messages=messages, status=status)
+                fallback, messages=messages, status='error')
+        return self._parse_result(
+            fallback, messages=messages, status=f"{status}_fallback")
 
 
 # =============================================================================

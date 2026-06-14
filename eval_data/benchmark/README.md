@@ -175,6 +175,22 @@ Each invocation creates a new timestamped directory below
 `TOOL_TYPE=four`, so search, visit, Google Scholar, and Python remain available;
 the only capability difference is `call_sub_agent`.
 
+One-row SearchSwarm smoke runs default `BENCHMARK_REQUIRE_SUB_AGENT_CALL=1`.
+This adds a smoke-only requirement to dispatch at least one meaningful
+sub-agent and makes the wrapper fail if no usable sub-agent trajectory is
+produced. Multi-row runs default it to `0`, preserving the model's natural
+delegation policy; either behavior can be selected explicitly with the same
+variable. Single-agent runs always disable the requirement and fail validation
+if a sub-agent trajectory appears. Tool-call format retries default to three
+and can be changed with `BENCHMARK_MAX_TOOL_FORMAT_RETRIES`.
+
+When a sub-agent reaches a force-answer boundary,
+`SUB_AGENT_FORCE_ANSWER_ATTEMPTS` controls how many no-tools delivery attempts
+are allowed (default: `2`). Text-encoded DSML/XML tool calls are rejected and
+retried once by default. If no valid `<report>` is produced, the harness gives
+the main agent a clearly marked evidence fallback, while strict smoke
+validation still fails with a fallback-only status.
+
 ## Redistribution and git
 
 BrowseComp and xBench ship encrypted data with canaries stating that plaintext

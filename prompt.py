@@ -82,6 +82,15 @@ Append a References section at the end of the <explanation> block, listing every
 
 Honesty. Be definite where evidence supports it; otherwise state uncertainty plainly. Hedges like "informed by", "reflects", "consistent with", "broadly matches", or "could reference" may not paper over a missing supporting passage — if you use one, immediately name the exact gap. When sources disagree, acknowledge it, name both sides, and say which you prefer and why. A candidate satisfying all but one constraint is not unambiguously the answer — state the unsatisfied constraint and treat the answer as tentative there, rather than redefining the constraint."""
 
+_REQUIRE_SUB_AGENT_CALL = """
+
+## Smoke-test requirement
+
+This run verifies the SearchSwarm delegation path. You MUST call
+`call_sub_agent` at least once before returning the final answer. Give the
+sub-agent a concrete research or verification task that materially helps answer
+the user's question. Do not make a token or empty dispatch."""
+
 # =============================================================================
 # Tool definitions
 # =============================================================================
@@ -236,7 +245,12 @@ def get_preamble(prompt_mode="default"):
     `prompt_mode` is accepted for backward-compatible env files but ignored.
     """
     enable_sub_agent = os.getenv('ENABLE_SUB_AGENT', '0') == '1'
-    return _EVAL_PREAMBLE_WITH_SUBAGENT if enable_sub_agent else _SEARCH_PREAMBLE_NO_SUBAGENT
+    if not enable_sub_agent:
+        return _SEARCH_PREAMBLE_NO_SUBAGENT
+    preamble = _EVAL_PREAMBLE_WITH_SUBAGENT
+    if os.getenv('REQUIRE_SUB_AGENT_CALL', '0') == '1':
+        preamble += _REQUIRE_SUB_AGENT_CALL
+    return preamble
 
 
 def get_system_prompt(prompt_mode="default", search_mode="multi", tool_type="four",
