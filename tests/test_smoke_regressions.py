@@ -1,11 +1,16 @@
 import os
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from scripts.validate_smoke_run import validate_smoke_run
+from scripts.validate_smoke_run import (
+    build_validation_summary,
+    validate_smoke_run,
+)
+from final_safety import contains_pseudo_tool_call
 from tool_call_utils import normalize_tool_args
 
 
@@ -78,8 +83,189 @@ class ApiCallBudgetTests(unittest.TestCase):
         )
         self.assertEqual(calls, [True, False])
 
+    def test_no_tool_final_dsml_is_repaired_before_prediction_write(self):
+        with patch.dict(os.environ, {
+            "API_KEY": "offline-test-key",
+            "OPENAI_API_KEY": "offline-test-key",
+        }):
+            import react_agent
+
+        agent = react_agent.MultiTurnReactAgent.__new__(
+            react_agent.MultiTurnReactAgent)
+        agent._model_uses_reasoning = False
+        agent._tokenizer = None
+        agent.model_mode = "api"
+
+        calls = []
+
+        def fake_call_api(messages, max_tokens=None, use_tools=True):
+            calls.append(use_tools)
+            if use_tools:
+                return (
+                    '<｜tool▁calls▁begin｜>{"name":"search","arguments":{}}',
+                    None,
+                    {"prompt_tokens": 100},
+                    "",
+                    "stop",
+                )
+            return (
+                "<answer>clean final answer</answer>",
+                None,
+                {"prompt_tokens": 120},
+                "",
+                "stop",
+            )
+
+        agent.call_api = fake_call_api
+        data = {"item": {"task_question": "question", "ground_truth": "truth"}}
+        with patch.object(react_agent, "MAX_LLM_CALL_PER_RUN", 5), \
+                patch.object(react_agent, "TOKEN_COUNTER", "api"), \
+                patch.object(react_agent, "RUN_TIMEOUT_MINUTES", 1):
+            result = agent._run_api(data, "test-model")
+
+        self.assertEqual(result["prediction"], "clean final answer")
+        self.assertFalse(contains_pseudo_tool_call(result["prediction"]))
+        self.assertEqual(calls, [True, False])
+
+    def test_final_dsml_repair_failure_is_suppressed(self):
+        with patch.dict(os.environ, {
+            "API_KEY": "offline-test-key",
+            "OPENAI_API_KEY": "offline-test-key",
+        }):
+            import react_agent
+
+        agent = react_agent.MultiTurnReactAgent.__new__(
+            react_agent.MultiTurnReactAgent)
+        agent._model_uses_reasoning = False
+        agent._tokenizer = None
+        agent.model_mode = "api"
+
+        def fake_call_api(messages, max_tokens=None, use_tools=True):
+            bad = '<tool_call>{"name":"search","arguments":{}}</tool_call>'
+            return bad, None, {"prompt_tokens": 100}, "", "stop"
+
+        agent.call_api = fake_call_api
+        data = {"item": {"task_question": "question", "ground_truth": "truth"}}
+        with patch.object(react_agent, "MAX_LLM_CALL_PER_RUN", 5), \
+                patch.object(react_agent, "TOKEN_COUNTER", "api"), \
+                patch.object(react_agent, "RUN_TIMEOUT_MINUTES", 1):
+            result = agent._run_api(data, "test-model")
+
+        self.assertIn("invalid tool-call-like final answer suppressed",
+                      result["prediction"])
+        self.assertFalse(contains_pseudo_tool_call(result["prediction"]))
+
+    def test_required_sub_agent_bootstrap_runs_when_model_does_not_delegate(self):
+        with patch.dict(os.environ, {
+            "API_KEY": "offline-test-key",
+            "OPENAI_API_KEY": "offline-test-key",
+        }):
+            import react_agent
+
+        agent = react_agent.MultiTurnReactAgent.__new__(
+            react_agent.MultiTurnReactAgent)
+        agent._model_uses_reasoning = False
+        agent._tokenizer = None
+        agent.model_mode = "api"
+
+        calls = []
+
+        def fake_call_tool(tool_name, tool_args, **kwargs):
+            calls.append((tool_name, tool_args, kwargs))
+            return (
+                'A sub-agent dispatched for goal "bootstrap smoke sub-agent '
+                'report" returned the following report:\n\n'
+                '<report>\nanswer: candidate\n'
+                'evidence:\n- evidence\nconfidence: low\n</report>'
+            )
+
+        def fake_call_api(messages, max_tokens=None, use_tools=True):
+            return (
+                "<answer>final answer</answer>",
+                None,
+                {"prompt_tokens": 100},
+                "",
+                "stop",
+            )
+
+        agent.custom_call_tool = fake_call_tool
+        agent.call_api = fake_call_api
+        data = {"item": {"task_question": "question", "ground_truth": "truth"}}
+        with patch.object(react_agent, "ENABLE_SUB_AGENT", True), \
+                patch.object(react_agent, "REQUIRE_SUB_AGENT_CALL", True), \
+                patch.object(react_agent, "TOOL_MAP", {"call_sub_agent": object()}), \
+                patch.object(react_agent, "MAX_LLM_CALL_PER_RUN", 5), \
+                patch.object(react_agent, "TOKEN_COUNTER", "api"), \
+                patch.object(react_agent, "RUN_TIMEOUT_MINUTES", 10):
+            result = agent._run_api(data, "test-model")
+
+        self.assertEqual(result["prediction"], "final answer")
+        self.assertEqual(calls[0][0], "call_sub_agent")
+        self.assertIn("parent_deadline", calls[0][2])
+        tool_messages = [
+            m for m in result["messages"]
+            if m.get("role") == "tool"
+            and m.get("tool_call_id") == "bootstrap_sub_agent_1"
+        ]
+        bootstrap_assistant = [
+            m for m in result["messages"]
+            if m.get("role") == "assistant"
+            and any(
+                tc.get("id") == "bootstrap_sub_agent_1"
+                for tc in (m.get("tool_calls") or [])
+            )
+        ]
+        self.assertEqual(len(bootstrap_assistant), 1)
+        self.assertIn("reasoning_content", bootstrap_assistant[0])
+        self.assertEqual(len(tool_messages), 1)
+        self.assertIn("<report>", tool_messages[0]["content"])
+
+    def test_main_synthetic_tool_call_gets_reasoning_backstop(self):
+        with patch.dict(os.environ, {
+            "API_KEY": "offline-test-key",
+            "OPENAI_API_KEY": "offline-test-key",
+        }):
+            import react_agent
+
+        agent = react_agent.MultiTurnReactAgent.__new__(
+            react_agent.MultiTurnReactAgent)
+        agent._model_uses_reasoning = True
+
+        message = agent._make_assistant_msg(
+            "synthetic delegation",
+            tool_calls=[{
+                "id": "synthetic-1",
+                "type": "function",
+                "function": {
+                    "name": "call_sub_agent",
+                    "arguments": "{}",
+                },
+            }],
+        )
+
+        self.assertEqual(message["reasoning_content"], ".")
+        self.assertEqual(message["tool_calls"][0]["id"], "synthetic-1")
+
 
 class SmokeValidationTests(unittest.TestCase):
+    def test_rejects_incomplete_full_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = root / "iter1.jsonl"
+            result.write_text(
+                json.dumps({"prediction": "answer"}) + "\n",
+                encoding="utf-8",
+            )
+            errors, result_count, _ = validate_smoke_run(
+                result,
+                root / "subagent_trajectories.jsonl",
+                "single",
+                expected_count=20,
+            )
+            self.assertEqual(result_count, 1)
+            self.assertTrue(any(
+                "expected 20" in error for error in errors))
+
     def test_rejects_no_answer_sentinel(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -98,6 +284,73 @@ class SmokeValidationTests(unittest.TestCase):
             )
             self.assertTrue(any("no-answer sentinel" in error for error in errors))
             self.assertTrue(any("termination" in error for error in errors))
+
+    def test_rejects_pseudo_tool_call_prediction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = root / "iter1.jsonl"
+            result.write_text(
+                json.dumps({
+                    "prediction": (
+                        '<｜tool▁calls▁begin｜>{"name":"search",'
+                        '"arguments":{}}'
+                    ),
+                }) + "\n",
+                encoding="utf-8",
+            )
+            errors, _, _ = validate_smoke_run(
+                result,
+                root / "subagent_trajectories.jsonl",
+                "single",
+            )
+            self.assertTrue(any("pseudo tool-call" in error for error in errors))
+
+    def test_nonzero_run_exit_code_fails_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = root / "iter1.jsonl"
+            result.write_text(
+                json.dumps({"prediction": "answer"}) + "\n",
+                encoding="utf-8",
+            )
+            errors, _, _ = validate_smoke_run(
+                result,
+                root / "subagent_trajectories.jsonl",
+                "single",
+                run_exit_code=1,
+            )
+            self.assertTrue(any("exit code 1" in error for error in errors))
+
+    def test_suppressed_placeholder_summary_and_strict_usable(self):
+        prediction = (
+            "[Failed: invalid tool-call-like final answer suppressed "
+            "(dsml_tool_call)]"
+        )
+        summary = build_validation_summary(
+            [{"prediction": prediction}],
+            [],
+            run_exit_code=0,
+            validation_status="success",
+            validation_executed=True,
+        )
+        self.assertEqual(summary["prediction_suppressed_count"], 1)
+        self.assertEqual(summary["prediction_failed_placeholder_count"], 1)
+        self.assertEqual(summary["usable_prediction_count"], 0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = root / "iter1.jsonl"
+            result.write_text(
+                json.dumps({"prediction": prediction}) + "\n",
+                encoding="utf-8",
+            )
+            errors, _, _ = validate_smoke_run(
+                result,
+                root / "subagent_trajectories.jsonl",
+                "single",
+                strict_usable=True,
+            )
+            self.assertTrue(any("usable prediction" in error for error in errors))
 
     def test_swarm_requires_usable_trajectory(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -229,6 +482,23 @@ class SubAgentForceAnswerTests(unittest.TestCase):
             '<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name="search">'))
         self.assertFalse(detect("<report>usable evidence</report>"))
 
+    def test_sub_agent_synthetic_tool_call_gets_reasoning_backstop(self):
+        agent = self._agent()
+        message = agent._make_assistant_msg(
+            "",
+            tool_calls=[{
+                "id": "sub-synthetic-1",
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "arguments": '{"query": ["x"]}',
+                },
+            }],
+        )
+
+        self.assertEqual(message["reasoning_content"], ".")
+        self.assertEqual(message["tool_calls"][0]["id"], "sub-synthetic-1")
+
     def test_structured_force_answer_retries_dsml_then_accepts_report(self):
         agent = self._agent()
         responses = iter([
@@ -260,7 +530,10 @@ class SubAgentForceAnswerTests(unittest.TestCase):
             result = agent._force_answer_structured(
                 messages, object(), "model", True, status="max_calls")
 
-        self.assertEqual(result["content"], "Recovered final report.")
+        self.assertEqual(
+            result["content"],
+            "<report>\nRecovered final report.\n</report>",
+        )
         self.assertEqual(result["status"], "max_calls")
         self.assertEqual(result["llm_calls"], 2)
         self.assertIn(
@@ -291,6 +564,7 @@ class SubAgentForceAnswerTests(unittest.TestCase):
                 messages, object(), "model", True, status="max_calls")
 
         self.assertEqual(result["status"], "max_calls_fallback")
+        self.assertIn("<report>", result["content"])
         self.assertIn("Fallback report", result["content"])
         self.assertIn("100 million", result["content"])
         self.assertNotIn("DSML", result["content"])
@@ -319,6 +593,7 @@ class SubAgentForceAnswerTests(unittest.TestCase):
             (messages[-1]["reasoning_content"],),
         )
         self.assertIn("100 million years", report)
+        self.assertIn("<report>", report)
         self.assertNotIn("different approach", report)
         self.assertNotIn("Empty response", report)
 
@@ -342,9 +617,72 @@ class SubAgentForceAnswerTests(unittest.TestCase):
             result = agent._force_answer_xml(
                 messages, object(), "model", status="max_calls")
 
-        self.assertEqual(result["content"], "XML path recovered report.")
+        self.assertEqual(
+            result["content"],
+            "<report>\nXML path recovered report.\n</report>",
+        )
         self.assertEqual(result["status"], "max_calls")
         self.assertEqual(result["llm_calls"], 2)
+
+    def test_call_sub_agent_clips_timeout_to_parent_remaining_budget(self):
+        tool = self.module.CallSubAgent(tool_map={})
+        captured = {}
+
+        def fake_run(self_agent, prompt, main_model=None, timeout_seconds=None):
+            captured["timeout_seconds"] = timeout_seconds
+            return {
+                "content": "<report>\nanswer: ok\nevidence:\n- e\nconfidence: high\n</report>",
+                "messages": [],
+                "queries": [],
+                "llm_calls": 0,
+                "status": "completed",
+                "duration_ms": 0,
+            }
+
+        with patch.object(self.module.SubAgent, "run", fake_run), \
+                patch.object(self.module, "SUB_AGENT_TIMEOUT_MINUTES", 2.0), \
+                patch.object(self.module, "PARENT_FINAL_RESERVE_MINUTES", 1.5):
+            output = tool.call(
+                {
+                    "prompts": [{
+                        "prompt": "verify one fact",
+                        "goal": "verify",
+                    }]
+                },
+                model="model",
+                question="parent",
+                parent_deadline=time.time() + 200,
+            )
+
+        self.assertIn("<report>", output)
+        self.assertGreater(captured["timeout_seconds"], 100)
+        self.assertLessEqual(captured["timeout_seconds"], 120)
+
+    def test_call_sub_agent_skips_when_parent_budget_too_low(self):
+        tool = self.module.CallSubAgent(tool_map={})
+        records = []
+        with patch.object(self.module.SubAgent, "run") as run_mock, \
+                patch.object(self.module, "_write_trajectory",
+                             lambda record: records.append(record)), \
+                patch.object(self.module, "PARENT_FINAL_RESERVE_MINUTES", 1.5), \
+                patch.object(self.module, "SUB_AGENT_MIN_TIMEOUT_SECONDS", 30):
+            output = tool.call(
+                {
+                    "prompts": [{
+                        "prompt": "verify one fact",
+                        "goal": "verify",
+                    }]
+                },
+                model="model",
+                question="parent",
+                parent_deadline=time.time() + 100,
+            )
+
+        self.assertIn("dispatch skipped", output)
+        run_mock.assert_not_called()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["status"], "skipped_due_to_parent_budget")
+        self.assertIn("<report>", records[0]["content"])
 
 
 if __name__ == "__main__":

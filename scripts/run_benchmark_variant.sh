@@ -74,7 +74,13 @@ fi
 
 RUN_ID="${BENCHMARK_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
 RUN_ROOT="$SCRIPT_DIR/results/benchmark/$DATASET_NAME/$SETTING/$RUN_ID"
-EXPERIMENT_NAME_VALUE="smoke"
+if [[ -n "${BENCHMARK_EXPERIMENT_NAME:-}" ]]; then
+    EXPERIMENT_NAME_VALUE="$BENCHMARK_EXPERIMENT_NAME"
+elif [[ "$MAX_SAMPLES" -eq 1 ]]; then
+    EXPERIMENT_NAME_VALUE="smoke"
+else
+    EXPERIMENT_NAME_VALUE="benchmark"
+fi
 MODEL_NAME="$(basename "${MODEL_PATH%/}")"
 RESULT_DIR="$RUN_ROOT/${MODEL_NAME}_${EXPERIMENT_NAME_VALUE}"
 
@@ -94,15 +100,18 @@ export SEARCH_MODE="${BENCHMARK_SEARCH_MODE:-multi}"
 export ROLLOUT_COUNT=1
 export MAX_WORKERS=1
 export RUN_TIMEOUT_MINUTES="${BENCHMARK_TIMEOUT_MINUTES:-10}"
-export SUB_AGENT_TIMEOUT_MINUTES="${BENCHMARK_TIMEOUT_MINUTES:-10}"
+export SUB_AGENT_TIMEOUT_MINUTES="${BENCHMARK_SUB_AGENT_TIMEOUT_MINUTES:-2}"
+export SUB_AGENT_MAX_LLM_CALLS="${BENCHMARK_SUB_AGENT_MAX_LLM_CALLS:-3}"
+export PARENT_FINAL_RESERVE_MINUTES="${BENCHMARK_PARENT_FINAL_RESERVE_MINUTES:-1.5}"
+export SUB_AGENT_MIN_TIMEOUT_SECONDS="${BENCHMARK_SUB_AGENT_MIN_TIMEOUT_SECONDS:-30}"
 export MAX_TOOL_FORMAT_RETRIES="${BENCHMARK_MAX_TOOL_FORMAT_RETRIES:-3}"
 
 JUDGE_ENABLED="${BENCHMARK_JUDGE_ENABLED:-0}"
-WALL_TIMEOUT_MINUTES="$((RUN_TIMEOUT_MINUTES + 2))"
+WALL_TIMEOUT_MINUTES="${BENCHMARK_WALL_TIMEOUT_MINUTES:-$((RUN_TIMEOUT_MINUTES * MAX_SAMPLES + 10))}"
 
 cat <<EOF
-Benchmark smoke configuration
-=============================
+Benchmark run configuration
+===========================
 dataset: $DATASET_PATH
 dataset_name: $DATASET_NAME
 setting: $SETTING
@@ -116,6 +125,9 @@ result_dir: $RESULT_DIR
 max_samples: $MAX_SAMPLES
 rollouts: $ROLLOUT_COUNT
 run_timeout_minutes: $RUN_TIMEOUT_MINUTES
+sub_agent_timeout_minutes: ${SUB_AGENT_TIMEOUT_MINUTES:-n/a}
+sub_agent_max_llm_calls: ${SUB_AGENT_MAX_LLM_CALLS:-n/a}
+parent_final_reserve_minutes: ${PARENT_FINAL_RESERVE_MINUTES:-n/a}
 judge_enabled: $JUDGE_ENABLED
 judge_model: ${JUDGE_MODEL_NAME:-unset}
 EOF
@@ -134,6 +146,7 @@ keys = [
     "MAX_LLM_CALL_PER_RUN", "MAX_CONTEXT_TOKENS", "MAX_GENERATION_TOKENS",
     "RUN_TIMEOUT_MINUTES", "SUB_AGENT_MAX_LLM_CALLS",
     "SUB_AGENT_TIMEOUT_MINUTES", "SUB_AGENT_FORCE_ANSWER_ATTEMPTS",
+    "PARENT_FINAL_RESERVE_MINUTES", "SUB_AGENT_MIN_TIMEOUT_SECONDS",
     "TEMPERATURE", "TOP_P",
     "PRESENCE_PENALTY", "MAX_TOOL_FORMAT_RETRIES",
 ]
@@ -154,52 +167,149 @@ ELAPSED_SECONDS="$((END_EPOCH - START_EPOCH))"
 
 RESULT_FILE="$RESULT_DIR/iter1.jsonl"
 TRAJECTORY_FILE="$RESULT_DIR/subagent_trajectories.jsonl"
-VALIDATION_STATUS=0
+VALIDATION_STATUS=""
+VALIDATION_STATE="skipped"
+VALIDATION_EXECUTED=0
+VALIDATION_SUMMARY_FILE="$RUN_ROOT/validation_summary.json"
 if [[ "$RUN_STATUS" -eq 0 ]]; then
     set +e
     VALIDATION_ARGS=(
         --result "$RESULT_FILE"
         --trajectory "$TRAJECTORY_FILE"
         --setting "$SETTING"
+        --run-exit-code "$RUN_STATUS"
+        --summary-json "$VALIDATION_SUMMARY_FILE"
     )
     if [[ "$REQUIRE_SUB_AGENT_CALL" == "1" ]]; then
         VALIDATION_ARGS+=(--require-sub-agent)
     fi
+    VALIDATION_ARGS+=(--expected-count "$MAX_SAMPLES")
     python "$SCRIPT_DIR/scripts/validate_smoke_run.py" \
         "${VALIDATION_ARGS[@]}"
     VALIDATION_STATUS=$?
+    VALIDATION_EXECUTED=1
     set -e
     if [[ "$VALIDATION_STATUS" -ne 0 ]]; then
+        VALIDATION_STATE="failed"
         RUN_STATUS=65
+    else
+        VALIDATION_STATE="success"
     fi
+else
+    VALIDATION_STATUS="null"
+    python - "$VALIDATION_SUMMARY_FILE" "$RUN_STATUS" "$RESULT_FILE" "$TRAJECTORY_FILE" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+from final_safety import (
+    contains_pseudo_tool_call,
+    is_failed_placeholder_prediction,
+    is_suppressed_prediction,
+    is_usable_prediction,
+)
+
+
+def load_jsonl(path):
+    path = Path(path)
+    if not path.exists():
+        return []
+    rows = []
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    pass
+    return rows
+
+
+records = load_jsonl(sys.argv[3])
+trajectories = load_jsonl(sys.argv[4])
+statuses = [str(row.get("status") or "").lower() for row in trajectories]
+
+payload = {
+    "run_success": False,
+    "run_exit_code": int(sys.argv[2]),
+    "validation_status": "skipped",
+    "validation_executed": False,
+    "result_count": len(records),
+    "prediction_empty_count": sum(
+        1 for row in records
+        if not str(row.get("prediction") or "").strip()
+    ),
+    "prediction_dsml_count": sum(
+        1 for row in records
+        if contains_pseudo_tool_call(row.get("prediction"))
+    ),
+    "prediction_no_answer_count": sum(
+        1 for row in records
+        if str(row.get("prediction") or "").strip().lower().startswith("no answer found")
+    ),
+    "prediction_suppressed_count": sum(
+        1 for row in records
+        if is_suppressed_prediction(row.get("prediction"))
+    ),
+    "prediction_failed_placeholder_count": sum(
+        1 for row in records
+        if is_failed_placeholder_prediction(row.get("prediction"))
+    ),
+    "usable_prediction_count": sum(
+        1 for row in records
+        if is_usable_prediction(row.get("prediction"))
+    ),
+    "subagent_total": len(trajectories),
+    "subagent_completed": statuses.count("completed"),
+    "subagent_fallback": sum(1 for status in statuses if status.endswith("_fallback")),
+    "subagent_max_calls": sum(1 for status in statuses if status.startswith("max_calls")),
+}
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, ensure_ascii=False, indent=2)
+PY
 fi
 
 python - "$RUN_ROOT/run_status.json" "$RUN_STATUS" "$ELAPSED_SECONDS" \
-    "$RESULT_DIR" "$VALIDATION_STATUS" <<'PY'
+    "$RESULT_DIR" "$VALIDATION_STATUS" "$VALIDATION_STATE" \
+    "$VALIDATION_EXECUTED" "$VALIDATION_SUMMARY_FILE" <<'PY'
 import json
 import os
 import sys
 
 status_code = int(sys.argv[2])
 result_dir = sys.argv[4]
+validation_raw = sys.argv[5]
+validation_exit_code = None if validation_raw == "null" else int(validation_raw)
+summary = {}
+try:
+    with open(sys.argv[8], "r", encoding="utf-8") as handle:
+        summary = json.load(handle)
+except Exception:
+    summary = {}
 payload = {
     "exit_code": status_code,
     "elapsed_seconds": int(sys.argv[3]),
     "timed_out": status_code in (124, 137),
-    "validation_exit_code": int(sys.argv[5]),
+    "validation_exit_code": validation_exit_code,
+    "validation_status": sys.argv[6],
+    "validation_executed": sys.argv[7] == "1",
+    "validation_summary_file": sys.argv[8],
     "result_dir": result_dir,
     "result_file": os.path.join(result_dir, "iter1.jsonl"),
     "subagent_trajectory_file": os.path.join(
         result_dir, "subagent_trajectories.jsonl"
     ),
 }
+payload.update(summary)
 with open(sys.argv[1], "w", encoding="utf-8") as handle:
     json.dump(payload, handle, ensure_ascii=False, indent=2)
 PY
 
 echo "elapsed_seconds: $ELAPSED_SECONDS"
 echo "exit_code: $RUN_STATUS"
+echo "validation_status: $VALIDATION_STATE"
 echo "validation_exit_code: $VALIDATION_STATUS"
+echo "validation_summary_file: $VALIDATION_SUMMARY_FILE"
 echo "result_file: $RESULT_FILE"
 echo "subagent_trajectory_file: $TRAJECTORY_FILE"
 exit "$RUN_STATUS"

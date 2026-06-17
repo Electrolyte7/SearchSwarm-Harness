@@ -3,15 +3,21 @@
 
 import argparse
 import json
-import re
+import sys
 from pathlib import Path
 
-_TEXT_TOOL_CALL_RE = re.compile(
-    r"(?:<\s*(?:tool_call|tool_calls|invoke)\b"
-    r"|<(?:\|｜){2}DSML(?:\|｜){2}(?:tool_calls|invoke|parameter)\b"
-    r"|DSML.*tool_calls)",
-    re.IGNORECASE | re.DOTALL,
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from final_safety import (
+    contains_pseudo_tool_call,
+    is_failed_placeholder_prediction,
+    is_suppressed_prediction,
+    is_usable_prediction,
+    pseudo_tool_call_reasons,
 )
+
 _UNUSABLE_SUBAGENT_CONTENT = {
     "",
     "(Sub-agent returned no usable content.)",
@@ -30,17 +36,77 @@ def _usable_subagent_trajectory(record, allow_fallback=False):
     return (
         status != "error"
         and status != "timeout"
+        and not status.startswith("skipped")
         and (allow_fallback or not status.endswith("_fallback"))
         and content not in _UNUSABLE_SUBAGENT_CONTENT
-        and not _TEXT_TOOL_CALL_RE.search(content)
+        and not contains_pseudo_tool_call(content)
     )
 
 
+def build_validation_summary(records, trajectory_records, run_exit_code=None,
+                             validation_status="unknown",
+                             validation_executed=True):
+    predictions = [
+        record.get("prediction")
+        for record in records
+        if isinstance(record, dict)
+    ]
+    statuses = [
+        str(record.get("status") or "").strip().lower()
+        for record in trajectory_records
+        if isinstance(record, dict)
+    ]
+    return {
+        "run_success": run_exit_code == 0 if run_exit_code is not None else None,
+        "run_exit_code": run_exit_code,
+        "validation_status": validation_status,
+        "validation_executed": validation_executed,
+        "result_count": len(records),
+        "prediction_empty_count": sum(
+            1 for prediction in predictions
+            if not isinstance(prediction, str) or not prediction.strip()
+        ),
+        "prediction_dsml_count": sum(
+            1 for prediction in predictions
+            if contains_pseudo_tool_call(prediction)
+        ),
+        "prediction_no_answer_count": sum(
+            1 for prediction in predictions
+            if isinstance(prediction, str)
+            and prediction.strip().lower().startswith("no answer found")
+        ),
+        "prediction_suppressed_count": sum(
+            1 for prediction in predictions
+            if is_suppressed_prediction(prediction)
+        ),
+        "prediction_failed_placeholder_count": sum(
+            1 for prediction in predictions
+            if is_failed_placeholder_prediction(prediction)
+        ),
+        "usable_prediction_count": sum(
+            1 for prediction in predictions
+            if is_usable_prediction(prediction)
+        ),
+        "subagent_total": len(trajectory_records),
+        "subagent_completed": statuses.count("completed"),
+        "subagent_fallback": sum(
+            1 for status in statuses if status.endswith("_fallback")
+        ),
+        "subagent_max_calls": sum(
+            1 for status in statuses if status.startswith("max_calls")
+        ),
+    }
+
+
 def validate_smoke_run(result_path, trajectory_path, setting,
-                       require_sub_agent=False):
+                       require_sub_agent=False, expected_count=None,
+                       run_exit_code=None, strict_usable=False):
     errors = []
     records = []
     trajectory_records = []
+
+    if run_exit_code is not None and run_exit_code != 0:
+        errors.append(f"run process failed with exit code {run_exit_code}")
 
     if not result_path.is_file() or result_path.stat().st_size == 0:
         errors.append(f"missing or empty result file: {result_path}")
@@ -51,13 +117,34 @@ def validate_smoke_run(result_path, trajectory_path, setting,
             errors.append(f"invalid result JSONL: {exc}")
         if not records:
             errors.append("result JSONL contains no records")
+        elif expected_count is not None and len(records) != expected_count:
+            errors.append(
+                f"result JSONL contains {len(records)} records; "
+                f"expected {expected_count}"
+            )
         for index, record in enumerate(records, 1):
             prediction = record.get("prediction")
             if not isinstance(prediction, str) or not prediction.strip():
                 errors.append(f"result record {index} has an empty prediction")
-            elif prediction.strip().lower().startswith("no answer found"):
+            else:
+                if contains_pseudo_tool_call(prediction):
+                    errors.append(
+                        f"result record {index} contains pseudo tool-call "
+                        "text in prediction: "
+                        f"{', '.join(pseudo_tool_call_reasons(prediction))}"
+                    )
+                if prediction.strip().lower().startswith("no answer found"):
+                    errors.append(
+                        f"result record {index} contains a no-answer sentinel")
+                if strict_usable and not is_usable_prediction(prediction):
+                    errors.append(
+                        f"result record {index} does not contain a usable "
+                        "prediction"
+                    )
+            if record.get("error"):
                 errors.append(
-                    f"result record {index} contains a no-answer sentinel")
+                    f"result record {index} contains error: {record.get('error')}"
+                )
             termination = str(record.get("termination") or "").lower()
             if (
                 "exceed available llm calls" in termination
@@ -101,6 +188,10 @@ def main():
     parser.add_argument("--trajectory", type=Path, required=True)
     parser.add_argument("--setting", choices=("single", "swarm"), required=True)
     parser.add_argument("--require-sub-agent", action="store_true")
+    parser.add_argument("--expected-count", type=int)
+    parser.add_argument("--run-exit-code", type=int)
+    parser.add_argument("--summary-json", type=Path)
+    parser.add_argument("--strict-usable", action="store_true")
     args = parser.parse_args()
 
     errors, result_count, trajectory_count = validate_smoke_run(
@@ -108,17 +199,37 @@ def main():
         args.trajectory,
         args.setting,
         require_sub_agent=args.require_sub_agent,
+        expected_count=args.expected_count,
+        run_exit_code=args.run_exit_code,
+        strict_usable=args.strict_usable,
     )
+    records = _read_jsonl(args.result) if args.result.is_file() else []
+    trajectory_records = (
+        _read_jsonl(args.trajectory) if args.trajectory.is_file() else []
+    )
+    summary = build_validation_summary(
+        records,
+        trajectory_records,
+        run_exit_code=args.run_exit_code,
+        validation_status="failed" if errors else "success",
+        validation_executed=True,
+    )
+    if args.summary_json:
+        with args.summary_json.open("w", encoding="utf-8") as handle:
+            json.dump(summary, handle, ensure_ascii=False, indent=2)
     if errors:
         print("Smoke validation failed:")
         for error in errors:
             print(f"- {error}")
+        print("Validation summary:")
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
         raise SystemExit(1)
 
     print(
         "Smoke validation passed: "
         f"results={result_count}, subagent_trajectories={trajectory_count}"
     )
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

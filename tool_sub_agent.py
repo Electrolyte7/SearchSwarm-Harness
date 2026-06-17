@@ -35,6 +35,7 @@ from openai import (
 from qwen_agent.tools.base import BaseTool, register_tool
 
 from hermes_w_py_parser import parse_tool_call_blocks
+from final_safety import contains_pseudo_tool_call
 from tool_call_utils import normalize_tool_args
 from prompt import (
     SUB_AGENT_OPENAI_TOOLS,
@@ -49,8 +50,10 @@ SUB_AGENT_MODE = os.getenv('SUB_AGENT_MODE', os.getenv('MODEL_MODE', 'local'))
 SUB_AGENT_MODEL = os.getenv('SUB_AGENT_MODEL', '')
 SUB_AGENT_MAX_CONTEXT_TOKENS = int(os.getenv('SUB_AGENT_MAX_CONTEXT_TOKENS', 32768))
 SUB_AGENT_MAX_GENERATION_TOKENS = int(os.getenv('SUB_AGENT_MAX_GENERATION_TOKENS', 8192))
-SUB_AGENT_MAX_LLM_CALLS = int(os.getenv('SUB_AGENT_MAX_LLM_CALLS', 20))
-SUB_AGENT_TIMEOUT_MINUTES = int(os.getenv('SUB_AGENT_TIMEOUT_MINUTES', 30))
+SUB_AGENT_MAX_LLM_CALLS = int(os.getenv('SUB_AGENT_MAX_LLM_CALLS', 3))
+SUB_AGENT_TIMEOUT_MINUTES = float(os.getenv('SUB_AGENT_TIMEOUT_MINUTES', 2))
+PARENT_FINAL_RESERVE_MINUTES = float(os.getenv('PARENT_FINAL_RESERVE_MINUTES', 1.5))
+SUB_AGENT_MIN_TIMEOUT_SECONDS = float(os.getenv('SUB_AGENT_MIN_TIMEOUT_SECONDS', 30))
 SUB_AGENT_TEMPERATURE = float(os.getenv('SUB_AGENT_TEMPERATURE', '0.85'))
 SUB_AGENT_TOP_P = float(os.getenv('SUB_AGENT_TOP_P', '0.95'))
 SUB_AGENT_PRESENCE_PENALTY = float(os.getenv('SUB_AGENT_PRESENCE_PENALTY', '1.1'))
@@ -145,10 +148,19 @@ def count_messages_tokens(messages, tools=None):
 FORCE_ANSWER_PROMPT = (
     "You have reached the limit for this sub-task. Stop making tool calls "
     "and emit your final delivery turn now: a single <report>...</report> "
-    "block, formatted exactly as the system instructions require (with inline "
-    "citations [n] and a References section at the end of the <report>). Be "
-    "honest about uncertainty; prefer to say less than to include incorrect "
-    "claims."
+    "block. Use exactly this compact structure:\n"
+    "<report>\n"
+    "answer: the best direct result for only this delegated sub-task\n"
+    "evidence:\n"
+    "- first key evidence item\n"
+    "- second key evidence item if needed\n"
+    "- third key evidence item if needed\n"
+    "confidence: high/medium/low\n"
+    "</report>\n"
+    "Return at most three evidence bullets. Do not solve the parent task "
+    "unless this delegated sub-task asks for it. Do not output tool calls, "
+    "JSON tool structures, DSML, XML <tool_call> blocks, Action:, or "
+    "Observation:."
 )
 
 # Sentinel returned by _call_llm_* when the LLM retry loop is fully exhausted.
@@ -178,20 +190,15 @@ _ACTION_INTENT_RE = re.compile(
 
 def _extract_report_or_sentinel(text):
     if text and '<report>' in text and '</report>' in text:
-        return text.split('<report>', 1)[1].split('</report>', 1)[0].strip()
+        inner = text.split('<report>', 1)[1].split('</report>', 1)[0].strip()
+        if inner and not contains_pseudo_tool_call(inner):
+            return f"<report>\n{inner}\n</report>"
     return _NO_REPORT_SENTINEL
 
 
 def _contains_text_tool_call(text):
     """Return whether a no-tools response still encodes a tool invocation."""
-    if not text:
-        return False
-    return bool(
-        _DSML_TOOL_CALL_RE.search(text)
-        or _XML_TOOL_CALL_RE.search(text)
-        or "</tool_call>" in text.lower()
-        or "DSML" in text and "tool_calls" in text
-    )
+    return contains_pseudo_tool_call(text)
 
 
 def _usable_fallback_text(text):
@@ -225,10 +232,26 @@ def _usable_fallback_text(text):
 
 def _fallback_report(messages, candidates=()):
     """Recover an auditable report from generated text or gathered evidence."""
+    def as_report(usable):
+        lines = [line.strip() for line in usable.splitlines() if line.strip()]
+        evidence = lines[:3] or [usable[:500].strip()]
+        answer = lines[0] if lines else "Fallback report from existing evidence."
+        if len(answer) > 600:
+            answer = answer[:600].rstrip() + "..."
+        bullets = "\n".join(f"- {line[:1000]}" for line in evidence)
+        return (
+            "<report>\n"
+            f"answer: {_FALLBACK_PREFIX} {answer}\n"
+            "evidence:\n"
+            f"{bullets}\n"
+            "confidence: low\n"
+            "</report>"
+        )
+
     for candidate in candidates:
         usable = _usable_fallback_text(candidate)
         if usable:
-            return f"{_FALLBACK_PREFIX}\n\n{usable}"
+            return as_report(usable)
 
     for role, stdout_mode in (
         ("tool", "exclude"),
@@ -249,7 +272,7 @@ def _fallback_report(messages, candidates=()):
                     continue
                 if len(usable) > 6000:
                     usable = usable[:6000].rstrip() + "\n[Evidence truncated.]"
-                return f"{_FALLBACK_PREFIX}\n\n{usable}"
+                return as_report(usable)
     return _NO_REPORT_SENTINEL
 
 
@@ -410,7 +433,7 @@ class SubAgent:
         if self._model_uses_reasoning:
             if reasoning:
                 msg["reasoning_content"] = reasoning
-            elif not tool_calls:
+            else:
                 msg["reasoning_content"] = "."
         if tool_calls:
             msg["tool_calls"] = tool_calls
@@ -585,13 +608,21 @@ class SubAgent:
     # Main entry point
     # =================================================================
 
-    def run(self, prompt, main_model=None):
+    def run(self, prompt, main_model=None, timeout_seconds=None):
         self._searched_queries = []
         self._llm_calls_used = 0
         start_time = time.time()
+        effective_timeout = (
+            float(timeout_seconds)
+            if timeout_seconds is not None
+            else SUB_AGENT_TIMEOUT_MINUTES * 60
+        )
 
         preview = prompt.replace('\n', ' ')[:200]
-        print(f"[SubAgent] Starting task ({self.mode}): {preview}...")
+        print(
+            f"[SubAgent] Starting task ({self.mode}, "
+            f"timeout={effective_timeout:.1f}s): {preview}..."
+        )
 
         if self.mode == 'local':
             host, port = self._next_endpoint()
@@ -610,6 +641,7 @@ class SubAgent:
                 # block in a single assistant turn.
                 result = self._run_xml(
                     client, model, prompt,
+                    timeout_seconds=effective_timeout,
                     multi_tool=True)
         else:
             if not SUB_AGENT_MODEL:
@@ -618,7 +650,8 @@ class SubAgent:
             else:
                 print(f"[SubAgent] API mode: model={SUB_AGENT_MODEL}")
                 result = self._run_structured(self._api_client, SUB_AGENT_MODEL,
-                                              prompt, is_api=True)
+                                              prompt, is_api=True,
+                                              timeout_seconds=effective_timeout)
 
         result['duration_ms'] = int((time.time() - start_time) * 1000)
         return result
@@ -636,8 +669,14 @@ class SubAgent:
     # Structured tool-calling loop (API + local hermes_w_py)
     # =================================================================
 
-    def _run_structured(self, client, model, prompt, is_api=False):
+    def _run_structured(self, client, model, prompt, is_api=False,
+                        timeout_seconds=None):
         loop_start = time.time()
+        timeout_seconds = (
+            float(timeout_seconds)
+            if timeout_seconds is not None
+            else SUB_AGENT_TIMEOUT_MINUTES * 60
+        )
         cur_date = datetime.date.today().strftime("%Y-%m-%d")
 
         system_prompt = render_sub_agent_system_prompt(cur_date, include_tools=False)
@@ -653,8 +692,9 @@ class SubAgent:
         round_num = 0
 
         while num_calls > 0:
-            if time.time() - loop_start > SUB_AGENT_TIMEOUT_MINUTES * 60:
-                print(f"[SubAgent] Timeout after {SUB_AGENT_TIMEOUT_MINUTES} min")
+            remaining_seconds = timeout_seconds - (time.time() - loop_start)
+            if remaining_seconds <= 0:
+                print(f"[SubAgent] Timeout after {timeout_seconds:.1f}s")
                 return self._force_answer_structured(
                     messages, client, model, is_api, status='timeout')
 
@@ -730,7 +770,7 @@ class SubAgent:
                         messages_before, client, model, is_api,
                         status='token_limit')
 
-            if num_calls <= 1:
+            if num_calls <= 1 or remaining_seconds <= 45:
                 print("[SubAgent] Call limit approaching, forcing answer.")
                 return self._force_answer_structured(
                     messages, client, model, is_api, status='max_calls')
@@ -758,7 +798,7 @@ class SubAgent:
         for attempt in range(attempts):
             content, _, _, reasoning, finish_reason = self._call_llm_structured(
                 client, model, messages, use_tools=False, is_api=is_api,
-                max_tokens=max_tokens)
+                max_tokens=max_tokens, max_tries=1)
             self._llm_calls_used += 1
             messages.append(self._make_assistant_msg(
                 content, reasoning=reasoning))
@@ -802,8 +842,14 @@ class SubAgent:
     # tool_response message.
     # =================================================================
 
-    def _run_xml(self, client, model, prompt, multi_tool=True):
+    def _run_xml(self, client, model, prompt, timeout_seconds=None,
+                 multi_tool=True):
         loop_start = time.time()
+        timeout_seconds = (
+            float(timeout_seconds)
+            if timeout_seconds is not None
+            else SUB_AGENT_TIMEOUT_MINUTES * 60
+        )
         cur_date = datetime.date.today().strftime("%Y-%m-%d")
 
         system_prompt = render_sub_agent_system_prompt(cur_date, include_tools=True)
@@ -818,8 +864,9 @@ class SubAgent:
         round_num = 0
 
         while num_calls > 0:
-            if time.time() - loop_start > SUB_AGENT_TIMEOUT_MINUTES * 60:
-                print(f"[SubAgent] Timeout after {SUB_AGENT_TIMEOUT_MINUTES} min")
+            remaining_seconds = timeout_seconds - (time.time() - loop_start)
+            if remaining_seconds <= 0:
+                print(f"[SubAgent] Timeout after {timeout_seconds:.1f}s")
                 return self._force_answer_xml(messages, client, model, status='timeout')
 
             round_num += 1
@@ -904,7 +951,7 @@ class SubAgent:
                 return self._force_answer_xml(
                     messages_before, client, model, status='token_limit')
 
-            if num_calls <= 1:
+            if num_calls <= 1 or remaining_seconds <= 45:
                 print("[SubAgent] Call limit approaching, forcing answer.")
                 return self._force_answer_xml(messages, client, model, status='max_calls')
 
@@ -929,7 +976,7 @@ class SubAgent:
         attempts = max(1, SUB_AGENT_FORCE_ANSWER_ATTEMPTS)
         for attempt in range(attempts):
             content, _ = self._call_llm_xml(
-                client, model, messages, max_tokens=max_tokens)
+                client, model, messages, max_tokens=max_tokens, max_tries=1)
             self._llm_calls_used += 1
             messages.append({
                 "role": "assistant",
@@ -1067,14 +1114,53 @@ class CallSubAgent(BaseTool):
 
         main_model = kwargs.get('model')
         question = kwargs.get('question', '')
+        child_timeout_seconds = SUB_AGENT_TIMEOUT_MINUTES * 60
+        parent_deadline = kwargs.get('parent_deadline')
+        if parent_deadline is not None:
+            try:
+                parent_remaining = float(parent_deadline) - time.time()
+            except (TypeError, ValueError):
+                parent_remaining = None
+            if parent_remaining is not None:
+                available = parent_remaining - PARENT_FINAL_RESERVE_MINUTES * 60
+                if available < SUB_AGENT_MIN_TIMEOUT_SECONDS:
+                    message = (
+                        "Sub-agent dispatch skipped: parent remaining time "
+                        f"({parent_remaining:.1f}s) must reserve "
+                        f"{PARENT_FINAL_RESERVE_MINUTES:.1f} minutes for final "
+                        "synthesis."
+                    )
+                    for entry in entries:
+                        self._log_trajectory(question, entry, {
+                            "content": (
+                                "<report>\n"
+                                f"answer: {message}\n"
+                                "evidence:\n"
+                                "- skipped_due_to_parent_budget\n"
+                                "confidence: low\n"
+                                "</report>"
+                            ),
+                            "messages": [],
+                            "queries": [],
+                            "llm_calls": 0,
+                            "status": "skipped_due_to_parent_budget",
+                            "duration_ms": 0,
+                        })
+                    return message
+                child_timeout_seconds = min(child_timeout_seconds, available)
 
         print(f"[call_sub_agent] Dispatching {len(entries)} sub-agent(s) "
-              f"{'in parallel' if len(entries) > 1 else ''}...")
+              f"{'in parallel' if len(entries) > 1 else ''}"
+              f" with timeout={child_timeout_seconds:.1f}s...")
 
         if len(entries) == 1:
             agent = SubAgent(tool_map=self._tool_map)
             try:
-                result = agent.run(entries[0]["prompt"], main_model=main_model)
+                result = agent.run(
+                    entries[0]["prompt"],
+                    main_model=main_model,
+                    timeout_seconds=child_timeout_seconds,
+                )
             except Exception as e:
                 print(f"[call_sub_agent] Sub-agent failed: {e}")
                 result = {
@@ -1097,7 +1183,12 @@ class CallSubAgent(BaseTool):
             futures = {}
             for i, e in enumerate(entries):
                 agent = SubAgent(tool_map=self._tool_map)
-                future = pool.submit(agent.run, e["prompt"], main_model)
+                future = pool.submit(
+                    agent.run,
+                    e["prompt"],
+                    main_model,
+                    child_timeout_seconds,
+                )
                 futures[future] = i
 
             for future in as_completed(futures):

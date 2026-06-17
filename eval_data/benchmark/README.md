@@ -191,6 +191,35 @@ retried once by default. If no valid `<report>` is produced, the harness gives
 the main agent a clearly marked evidence fallback, while strict smoke
 validation still fails with a fallback-only status.
 
+## Full serial comparison
+
+After activating the `searchswarm-harness` conda environment, run:
+
+```bash
+bash run_all_80_serial.sh
+```
+
+This launches the four 20-row subsets in dataset order, running `single` and
+then `swarm` for each subset. It performs 160 model tasks in total: the same 80
+questions once per setting. Forced delegation is disabled.
+
+Preview all eight commands without making API calls:
+
+```bash
+DRY_RUN=1 bash run_all_80_serial.sh
+```
+
+The suite stops on the first failed run by default. To record a failure and
+continue with the remaining runs:
+
+```bash
+BENCHMARK_CONTINUE_ON_ERROR=1 bash run_all_80_serial.sh
+```
+
+Per-run outputs are written below
+`results/benchmark/<dataset>/<single|swarm>/<suite-id>/`. The suite status
+table is written to `results/benchmark/suites/<suite-id>/status.tsv`.
+
 ## Redistribution and git
 
 BrowseComp and xBench ship encrypted data with canaries stating that plaintext

@@ -17,6 +17,12 @@ from qwen_agent.tools import BaseTool
 from prompt import *
 
 from hermes_w_py_parser import parse_tool_call_blocks
+from final_safety import (
+    contains_pseudo_tool_call,
+    extract_answer_text,
+    pseudo_tool_call_reasons,
+    safe_fallback_prediction,
+)
 import main_checkpoint as _main_ckpt
 from tool_call_utils import normalize_tool_args
 from tool_search import *
@@ -82,6 +88,7 @@ def _log_empty_response(planning_port, msgs, response_msg, usage, finish_reason)
 
 
 ENABLE_SUB_AGENT = os.getenv('ENABLE_SUB_AGENT', '0') == '1'
+REQUIRE_SUB_AGENT_CALL = os.getenv('REQUIRE_SUB_AGENT_CALL', '0') == '1'
 
 TOOL_CLASS = [
     Visit(),
@@ -103,6 +110,14 @@ def today_date():
 
 
 def main_force_answer_prompt():
+    no_tool_clause = (
+        " Tool execution is disabled now. Do not output tool calls, JSON tool "
+        "structures, DSML, tool_calls, function_call, call_sub_agent, Action:, "
+        "or Observation:. Output only a concise natural-language final answer "
+        "inside <answer>...</answer>. If you do not know, output a brief "
+        "natural-language uncertainty statement inside <answer>; do not output "
+        "any tool structure."
+    )
     if ENABLE_SUB_AGENT:
         return (
             "You have reached the limit for this task. Stop making tool calls "
@@ -111,15 +126,44 @@ def main_force_answer_prompt():
             "<answer>...</answer> block, formatted exactly as the system "
             "instructions require. Put only the final answer itself inside "
             "<answer>. Be honest about uncertainty; prefer to say less than "
-            "to include incorrect claims."
+            "to include incorrect claims." + no_tool_clause
         )
     return (
         "You have now reached the maximum context length you can handle. You "
         "should stop making tool calls and, based on all the information above, "
-        "think again and provide what you consider the most likely answer in "
-        "the following format:<think>your final thinking</think>\n"
-        "<answer>your answer</answer>"
+        "provide what you consider the most likely answer. Prefer a short "
+        "answer. " + no_tool_clause
     )
+
+
+MAIN_FINAL_REPAIR_PROMPT = (
+    "The previous final answer was invalid because it contained text that looks "
+    "like a tool call or tool-call data. Tool execution is disabled. Using only "
+    "the evidence already present in the conversation, provide the final answer "
+    "now. Do not output tool calls, JSON tool structures, DSML, XML "
+    "<tool_call> blocks, tool_calls, function_call, call_sub_agent, Action:, or "
+    "Observation:. Output only final answer text inside one <answer>...</answer> "
+    "block."
+)
+
+
+BOOTSTRAP_SUB_AGENT_PROMPT_TEMPLATE = (
+    "Please act as a sub-agent and independently analyze the question below. "
+    "Your task is not a long complete proof; within a short budget, return the "
+    "most likely answer candidate, key evidence, and uncertainty. You must "
+    "output only:\n"
+    "<report>\n"
+    "answer: ...\n"
+    "evidence:\n"
+    "- ...\n"
+    "- ...\n"
+    "- ...\n"
+    "confidence: high/medium/low\n"
+    "</report>\n"
+    "Do not output tool calls, JSON, DSML, tool_calls, function_call, "
+    "call_sub_agent, Action:, or Observation:.\n\n"
+    "Question:\n{question}"
+)
 
 
 def filter_messages(messages, keep_last_n_users=5):
@@ -521,7 +565,7 @@ class MultiTurnReactAgent(FnCallAgent):
         if self._model_uses_reasoning:
             if reasoning:
                 msg["reasoning_content"] = reasoning
-            elif not tool_calls:
+            else:
                 msg["reasoning_content"] = "."
                 self._log_reasoning_fallback(content, tool_calls, reasoning)
         if tool_calls:
@@ -536,6 +580,137 @@ class MultiTurnReactAgent(FnCallAgent):
                         f"content={content!r}\n")
         except Exception:
             pass
+
+    def _repair_invalid_final_prediction(self, messages, planning_port=None):
+        """Ask once for a compressed no-tool final answer."""
+        repair_messages = deepcopy(messages or [])
+        repair_messages.append({"role": "user", "content": MAIN_FINAL_REPAIR_PROMPT})
+        if self.model_mode == 'api':
+            content, _, _, reasoning, _ = self.call_api(
+                repair_messages,
+                max_tokens=MAX_GENERATION_TOKENS,
+                use_tools=False,
+            )
+            repair_messages.append(self._make_assistant_msg(
+                (content or "").strip(), reasoning=reasoning))
+            repaired = extract_answer_text(content or reasoning or "")
+            return repaired, repair_messages
+        if TEMPLATE == 'hermes_w_py':
+            content, _, _, reasoning, _ = self.call_server_tools(
+                repair_messages,
+                planning_port,
+                tools=None,
+                max_tokens=MAX_GENERATION_TOKENS,
+                use_tools=False,
+            )
+            repair_messages.append(self._make_assistant_msg(
+                (content or "").strip(), reasoning=reasoning))
+            repaired = extract_answer_text(content or reasoning or "")
+            return repaired, repair_messages
+        content = self.call_server(
+            repair_messages,
+            planning_port,
+            max_tokens=MAX_GENERATION_TOKENS,
+        )
+        repair_messages.append({"role": "assistant", "content": (content or "").strip()})
+        return extract_answer_text(content or ""), repair_messages
+
+    def _sanitize_final_prediction(self, prediction, termination, messages,
+                                   planning_port=None):
+        """Prevent text-encoded tool calls from being written as predictions."""
+        prediction = "" if prediction is None else str(prediction)
+        reasons = pseudo_tool_call_reasons(prediction)
+        if not reasons:
+            return prediction, termination, messages
+
+        print(
+            "[final_safety] Final prediction contains pseudo-tool-call text "
+            f"({', '.join(reasons)}); attempting no-tool repair."
+        )
+        repaired, repair_messages = self._repair_invalid_final_prediction(
+            messages, planning_port=planning_port)
+        if repaired and not contains_pseudo_tool_call(repaired):
+            return (
+                repaired,
+                f"{termination}; repaired invalid tool-call-like final",
+                repair_messages,
+            )
+
+        repaired_reasons = pseudo_tool_call_reasons(repaired)
+        print(
+            "[final_safety] Repair failed or was empty; suppressing invalid "
+            f"prediction. repair_reasons={repaired_reasons}"
+        )
+        return (
+            safe_fallback_prediction(",".join(reasons)),
+            f"{termination}; invalid tool-call-like final suppressed",
+            repair_messages,
+        )
+
+    def _bootstrap_required_sub_agent(self, question, messages, start_time,
+                                      model):
+        if not (ENABLE_SUB_AGENT and REQUIRE_SUB_AGENT_CALL):
+            return messages
+        if "call_sub_agent" not in TOOL_MAP:
+            print("[bootstrap_sub_agent] call_sub_agent tool unavailable; skipped.")
+            return messages
+
+        parent_deadline = start_time + RUN_TIMEOUT_MINUTES * 60
+        parent_remaining = parent_deadline - time.time()
+        prompt = BOOTSTRAP_SUB_AGENT_PROMPT_TEMPLATE.format(question=question)
+        args = {
+            "prompts": [{
+                "prompt": prompt,
+                "goal": "bootstrap smoke sub-agent report",
+            }]
+        }
+        tool_call_id = "bootstrap_sub_agent_1"
+        bootstrap_msg = self._make_assistant_msg(
+            "Bootstrap smoke delegation: calling one sub-agent before main "
+            "research continues.",
+            tool_calls=[{
+                "id": tool_call_id,
+                "type": "function",
+                "function": {
+                    "name": "call_sub_agent",
+                    "arguments": json.dumps(args, ensure_ascii=False),
+                },
+            }],
+            reasoning=(
+                "REQUIRE_SUB_AGENT_CALL=1 requires one execution-layer "
+                "sub-agent dispatch for smoke coverage."
+            ),
+        )
+        if self.model_mode == 'api' and "reasoning_content" not in bootstrap_msg:
+            bootstrap_msg["reasoning_content"] = (
+                "REQUIRE_SUB_AGENT_CALL=1 requires one execution-layer "
+                "sub-agent dispatch for smoke coverage."
+            )
+        messages.append(bootstrap_msg)
+        print(
+            "[bootstrap_sub_agent] Dispatching required bootstrap sub-agent "
+            f"(parent_remaining={parent_remaining:.1f}s)."
+        )
+        try:
+            result = self.custom_call_tool(
+                "call_sub_agent",
+                args,
+                planning_port=None,
+                model=model,
+                question=question,
+                parent_deadline=parent_deadline,
+            )
+        except Exception as e:
+            result = (
+                "Bootstrap sub-agent dispatch failed: "
+                f"{type(e).__name__}: {e}"
+            )
+        messages.append({
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "content": result,
+        })
+        return messages
 
     # ==================================================================
     # Dispatch
@@ -615,6 +790,12 @@ class MultiTurnReactAgent(FnCallAgent):
         def finish(prediction, termination, stage, cur_messages,
                    cur_round_num, cur_num_llm_calls_available,
                    cur_format_retry_count, cur_start_time):
+            prediction, termination, cur_messages = self._sanitize_final_prediction(
+                prediction,
+                termination,
+                cur_messages,
+                planning_port=data.get("planning_port"),
+            )
             result = {
                 "question": question,
                 "answer": answer,
@@ -725,6 +906,7 @@ class MultiTurnReactAgent(FnCallAgent):
                                     planning_port=planning_port,
                                     model=self.model,
                                     question=question,
+                                    parent_deadline=start_time + RUN_TIMEOUT_MINUTES * 60,
                                 )
                             except ToolCallFormatError:
                                 raise
@@ -890,7 +1072,8 @@ class MultiTurnReactAgent(FnCallAgent):
                             try:
                                 one = self.custom_call_tool(blk['name'], blk['arguments'],
                                                             planning_port=planning_port, model=self.model,
-                                                            question=question)
+                                                            question=question,
+                                                            parent_deadline=start_time + RUN_TIMEOUT_MINUTES * 60)
                             except ToolCallFormatError:
                                 raise
                             except Exception:
@@ -1017,6 +1200,8 @@ class MultiTurnReactAgent(FnCallAgent):
                 round_num, format_retry_count, start_time)
         if completed_result is not None:
             return completed_result
+        messages = self._bootstrap_required_sub_agent(
+            question, messages, start_time, self.model)
         save_running(
             "start_or_resume", messages, round_num,
             num_llm_calls_available, format_retry_count, start_time)
@@ -1163,7 +1348,8 @@ class MultiTurnReactAgent(FnCallAgent):
                     try:
                         result = self.custom_call_tool(tool_name, tool_args,
                                                        planning_port=None, model=self.model,
-                                                       question=question)
+                                                       question=question,
+                                                       parent_deadline=start_time + RUN_TIMEOUT_MINUTES * 60)
                     except ToolCallFormatError as e:
                         format_retry_count += 1
                         if format_retry_count <= MAX_TOOL_FORMAT_RETRIES:
