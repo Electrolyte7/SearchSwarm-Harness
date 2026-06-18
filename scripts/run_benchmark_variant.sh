@@ -149,6 +149,15 @@ keys = [
     "PARENT_FINAL_RESERVE_MINUTES", "SUB_AGENT_MIN_TIMEOUT_SECONDS",
     "TEMPERATURE", "TOP_P",
     "PRESENCE_PENALTY", "MAX_TOOL_FORMAT_RETRIES",
+    "SEARCHSWARM_PATCH_V1", "SEARCHSWARM_PATCH_BUDGET_AWARE",
+    "SEARCHSWARM_PATCH_DUPLICATE_FILTER",
+    "SEARCHSWARM_PATCH_REPORT_QUALITY",
+    "SEARCHSWARM_PATCH_EARLY_STOP_RATIO",
+    "SEARCHSWARM_PATCH_DUPLICATE_THRESHOLD",
+    "SEARCHSWARM_PATCH_V2", "SEARCHSWARM_PATCH_FINAL_VERIFY",
+    "SEARCHSWARM_PATCH_CANDIDATE_LEDGER",
+    "SEARCHSWARM_PATCH_ADAPTIVE_ROUTER",
+    "SEARCHSWARM_PATCH_MAIN_EARLY_FINALIZE",
 ]
 config = {key: os.environ.get(key) for key in keys}
 config["judge_enabled"] = os.environ.get("BENCHMARK_JUDGE_ENABLED", "0") == "1"
@@ -228,6 +237,19 @@ def load_jsonl(path):
 records = load_jsonl(sys.argv[3])
 trajectories = load_jsonl(sys.argv[4])
 statuses = [str(row.get("status") or "").lower() for row in trajectories]
+steps = [float(row.get("steps", row.get("llm_calls", 0)) or 0) for row in trajectories]
+tool_calls = [float(row.get("tool_calls", 0) or 0) for row in trajectories]
+duplicate_pairs = [
+    {
+        "prompt": row.get("prompt", ""),
+        "matched_prompt": row.get("duplicate_matched_prompt", ""),
+        "similarity": row.get("duplicate_similarity"),
+    }
+    for row in trajectories
+    if row.get("duplicate_subagent_skipped")
+]
+def sum_int(rows, key):
+    return sum(int(row.get(key) or 0) for row in rows)
 
 payload = {
     "run_success": False,
@@ -263,6 +285,51 @@ payload = {
     "subagent_completed": statuses.count("completed"),
     "subagent_fallback": sum(1 for status in statuses if status.endswith("_fallback")),
     "subagent_max_calls": sum(1 for status in statuses if status.startswith("max_calls")),
+    "patch_enabled": any(bool(row.get("patch_enabled")) for row in trajectories),
+    "subagent_early_stop_count": sum(1 for row in trajectories if row.get("early_stop_triggered")),
+    "avg_subagent_steps": round(sum(steps) / len(steps), 2) if steps else 0,
+    "avg_subagent_tool_calls": round(sum(tool_calls) / len(tool_calls), 2) if tool_calls else 0,
+    "subagent_completed_count": statuses.count("completed"),
+    "subagent_fallback_count": sum(1 for status in statuses if status.endswith("_fallback")),
+    "subagent_max_calls_count": sum(1 for status in statuses if status.startswith("max_calls")),
+    "duplicate_subagent_skipped_count": sum(1 for row in trajectories if row.get("duplicate_subagent_skipped")),
+    "duplicate_subagent_brief_pairs": duplicate_pairs,
+    "subagent_brief_count_before_filter": sum(
+        int(row.get("brief_count_before_filter") or 0)
+        for row in trajectories
+        if row.get("duplicate_subagent_skipped")
+    ),
+    "subagent_brief_count_after_filter": sum(
+        int(row.get("brief_count_after_filter") or 0)
+        for row in trajectories
+        if row.get("duplicate_subagent_skipped")
+    ),
+    "low_quality_report_count": sum(1 for row in trajectories if row.get("low_quality_report") is True),
+    "high_quality_report_count": sum(1 for row in trajectories if row.get("low_quality_report") is False),
+    "report_with_candidate_count": sum(1 for row in trajectories if row.get("report_has_candidate")),
+    "report_with_evidence_count": sum(1 for row in trajectories if row.get("report_has_evidence")),
+    "patch_v2_enabled": any(bool(row.get("patch_v2_enabled")) for row in records),
+    "candidate_ledger_enabled": any(bool(row.get("candidate_ledger_enabled")) for row in records),
+    "candidate_count": sum_int(records, "candidate_count"),
+    "candidate_from_main_count": sum_int(records, "candidate_from_main_count"),
+    "candidate_from_subagent_count": sum_int(records, "candidate_from_subagent_count"),
+    "candidate_from_low_quality_report_count": sum_int(records, "candidate_from_low_quality_report_count"),
+    "candidate_deduplicated_count": sum_int(records, "candidate_deduplicated_count"),
+    "final_verifier_used_count": sum_int(records, "final_verifier_used_count"),
+    "final_verifier_changed_answer_count": sum_int(records, "final_verifier_changed_answer_count"),
+    "final_verifier_kept_answer_count": sum_int(records, "final_verifier_kept_answer_count"),
+    "final_verifier_rejected_candidate_count": sum_int(records, "final_verifier_rejected_candidate_count"),
+    "final_verifier_low_confidence_count": sum_int(records, "final_verifier_low_confidence_count"),
+    "final_verifier_empty_or_failed_count": sum_int(records, "final_verifier_empty_or_failed_count"),
+    "adaptive_router_enabled": any(bool(row.get("adaptive_router_enabled")) for row in records),
+    "router_decision_count": sum_int(records, "router_decision_count"),
+    "router_skip_delegation_count": sum_int(records, "router_skip_delegation_count"),
+    "router_allow_delegation_count": sum_int(records, "router_allow_delegation_count"),
+    "router_force_diverse_brief_count": sum_int(records, "router_force_diverse_brief_count"),
+    "router_stop_delegation_count": sum_int(records, "router_stop_delegation_count"),
+    "diverse_brief_generated_count": sum_int(records, "diverse_brief_generated_count"),
+    "duplicate_brief_rewritten_count": sum_int(records, "duplicate_brief_rewritten_count"),
+    "main_agent_early_finalize_count": sum_int(records, "main_agent_early_finalize_count"),
 }
 with open(sys.argv[1], "w", encoding="utf-8") as handle:
     json.dump(payload, handle, ensure_ascii=False, indent=2)

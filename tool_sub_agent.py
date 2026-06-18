@@ -15,7 +15,9 @@ import json5
 import os
 import re
 import time
+import math
 import random
+import difflib
 import datetime
 import threading
 import itertools
@@ -60,6 +62,26 @@ SUB_AGENT_PRESENCE_PENALTY = float(os.getenv('SUB_AGENT_PRESENCE_PENALTY', '1.1'
 SUB_AGENT_FORCE_ANSWER_ATTEMPTS = int(
     os.getenv('SUB_AGENT_FORCE_ANSWER_ATTEMPTS', 2))
 TEMPLATE = os.getenv('TEMPLATE', 'qwen3')
+
+
+def _env_bool(name, default=False):
+    value = os.getenv(name)
+    if value is None:
+        return bool(default)
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+SEARCHSWARM_PATCH_V1 = _env_bool("SEARCHSWARM_PATCH_V1", False)
+SEARCHSWARM_PATCH_BUDGET_AWARE = _env_bool(
+    "SEARCHSWARM_PATCH_BUDGET_AWARE", SEARCHSWARM_PATCH_V1)
+SEARCHSWARM_PATCH_DUPLICATE_FILTER = _env_bool(
+    "SEARCHSWARM_PATCH_DUPLICATE_FILTER", SEARCHSWARM_PATCH_V1)
+SEARCHSWARM_PATCH_REPORT_QUALITY = _env_bool(
+    "SEARCHSWARM_PATCH_REPORT_QUALITY", SEARCHSWARM_PATCH_V1)
+SEARCHSWARM_PATCH_EARLY_STOP_RATIO = float(
+    os.getenv("SEARCHSWARM_PATCH_EARLY_STOP_RATIO", "0.66"))
+SEARCHSWARM_PATCH_DUPLICATE_THRESHOLD = float(
+    os.getenv("SEARCHSWARM_PATCH_DUPLICATE_THRESHOLD", "0.72"))
 
 def _parse_endpoints(spec: str):
     out = []
@@ -163,6 +185,24 @@ FORCE_ANSWER_PROMPT = (
     "Observation:."
 )
 
+EARLY_STOP_FORCE_ANSWER_PROMPT = (
+    "You have used most of the delegated search budget and already gathered "
+    "some candidate evidence. Stop searching now and emit exactly one "
+    "<report>...</report> block. Use this structure:\n"
+    "<report>\n"
+    "candidate_answer: the best direct candidate for this sub-task, or blank "
+    "if no candidate is supported\n"
+    "supporting_evidence:\n"
+    "- quote, URL, title, snippet, or observation supporting the candidate\n"
+    "- second evidence item if available\n"
+    "confidence: high/medium/low\n"
+    "uncertainty_or_missing_evidence: what still needs verification\n"
+    "early_stop_triggered: true\n"
+    "</report>\n"
+    "Do not output tool calls, JSON tool structures, DSML, XML <tool_call> "
+    "blocks, Action:, or Observation:."
+)
+
 # Sentinel returned by _call_llm_* when the LLM retry loop is fully exhausted.
 # Downstream (_run_structured / _run_xml) must detect this and mark the
 # sub-agent's status as 'error' rather than 'completed'.
@@ -186,6 +226,195 @@ _ACTION_INTENT_RE = re.compile(
     r"different approach)\b",
     re.IGNORECASE,
 )
+_URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
+_CANDIDATE_RE = re.compile(
+    r"\b(?:candidate_answer|answer|possible answer|candidate|entity)\s*:\s*(.+)",
+    re.IGNORECASE,
+)
+_EVIDENCE_LABEL_RE = re.compile(
+    r"\b(?:supporting_evidence|evidence|source|sources|snippet|title|url)\s*:",
+    re.IGNORECASE,
+)
+_BRIEF_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "in",
+    "is", "it", "of", "on", "or", "search", "the", "to", "with",
+}
+
+
+def _normalize_brief(brief):
+    text = (brief or "").lower()
+    text = re.sub(r"[^\w\s]", " ", text)
+    tokens = [
+        token for token in text.split()
+        if token and token not in _BRIEF_STOPWORDS
+    ]
+    return " ".join(tokens)
+
+
+def _brief_similarity(brief_a, brief_b):
+    norm_a = _normalize_brief(brief_a)
+    norm_b = _normalize_brief(brief_b)
+    if not norm_a or not norm_b:
+        return 0.0
+    seq = difflib.SequenceMatcher(None, norm_a, norm_b).ratio()
+    tokens_a = set(norm_a.split())
+    tokens_b = set(norm_b.split())
+    jaccard = (
+        len(tokens_a & tokens_b) / len(tokens_a | tokens_b)
+        if tokens_a and tokens_b else 0.0
+    )
+    return max(seq, jaccard)
+
+
+def _is_duplicate_brief(brief, previous_briefs,
+                        threshold=SEARCHSWARM_PATCH_DUPLICATE_THRESHOLD):
+    best = None
+    best_score = 0.0
+    for old in previous_briefs or []:
+        score = _brief_similarity(brief, old)
+        if score > best_score:
+            best_score = score
+            best = old
+    return best is not None and best_score >= threshold, best, best_score
+
+
+def _message_text(message):
+    if not isinstance(message, dict):
+        return ""
+    return "\n".join(
+        str(message.get(key) or "")
+        for key in ("content", "reasoning_content")
+        if message.get(key)
+    )
+
+
+def _trajectory_has_early_stop_signal(messages):
+    for message in messages or []:
+        text = _message_text(message)
+        if not text.strip():
+            continue
+        lowered = text.lower()
+        if message.get("role") in ("tool", "user") and text.strip():
+            if message.get("role") == "tool" or "<tool_response>" in lowered:
+                return True
+        if (
+            _URL_RE.search(text)
+            or _CANDIDATE_RE.search(text)
+            or _EVIDENCE_LABEL_RE.search(text)
+            or "search result" in lowered
+            or "supporting evidence" in lowered
+            or "possible answer" in lowered
+            or "引用" in text
+        ):
+            return True
+    return False
+
+
+def _should_early_stop(used_calls, max_calls, messages):
+    if not SEARCHSWARM_PATCH_BUDGET_AWARE:
+        return False
+    if max_calls <= 0:
+        return False
+    trigger_at = max(1, math.ceil(max_calls * SEARCHSWARM_PATCH_EARLY_STOP_RATIO))
+    return (
+        used_calls >= trigger_at
+        and _trajectory_has_early_stop_signal(messages)
+    )
+
+
+def _extract_report_inner(text):
+    if not isinstance(text, str):
+        return ""
+    if "<report>" in text and "</report>" in text:
+        return text.split("<report>", 1)[1].split("</report>", 1)[0].strip()
+    return text.strip()
+
+
+def _extract_candidate_answer(report_text):
+    inner = _extract_report_inner(report_text)
+    for line in inner.splitlines():
+        match = _CANDIDATE_RE.search(line)
+        if match:
+            value = match.group(1).strip(" -")
+            if value:
+                return value[:500]
+    return ""
+
+
+def _extract_evidence_items(report_text):
+    inner = _extract_report_inner(report_text)
+    items = []
+    in_evidence = False
+    for line in inner.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if _EVIDENCE_LABEL_RE.search(stripped):
+            in_evidence = True
+            tail = stripped.split(":", 1)[1].strip() if ":" in stripped else ""
+            if tail:
+                items.append(tail)
+            continue
+        if in_evidence:
+            if re.match(r"^[A-Za-z_ ]+:", stripped) and not stripped.startswith("-"):
+                in_evidence = False
+                continue
+            if stripped.startswith(("-", "*")) or _URL_RE.search(stripped):
+                items.append(stripped.lstrip("-* ").strip())
+    if not items:
+        urls = _URL_RE.findall(inner)
+        items.extend(urls[:3])
+    return [item for item in items if item][:3]
+
+
+def _report_quality(report_text):
+    candidate = _extract_candidate_answer(report_text)
+    evidence = _extract_evidence_items(report_text)
+    reasons = []
+    if not candidate:
+        reasons.append("missing candidate_answer")
+    if not evidence:
+        reasons.append("missing supporting_evidence")
+    return {
+        "candidate_answer": candidate,
+        "supporting_evidence": evidence,
+        "low_quality_report": bool(reasons),
+        "report_quality_reason": "; ".join(reasons) if reasons else "candidate and evidence present",
+    }
+
+
+def _annotate_report_quality(report_text, early_stop_triggered=False):
+    if not SEARCHSWARM_PATCH_REPORT_QUALITY:
+        return report_text
+    quality = _report_quality(report_text)
+    inner = _extract_report_inner(report_text)
+    evidence_lines = "\n".join(
+        f"- {item}" for item in quality["supporting_evidence"]
+    )
+    if not evidence_lines:
+        evidence_lines = "- "
+    existing_confidence = re.search(
+        r"\bconfidence\s*:\s*(.+)", inner, flags=re.IGNORECASE)
+    confidence = (
+        existing_confidence.group(1).strip()
+        if existing_confidence else (
+            "low" if quality["low_quality_report"] else "medium")
+    )
+    return (
+        "<report>\n"
+        f"{inner}\n\n"
+        "report_quality_metadata:\n"
+        f"candidate_answer: {quality['candidate_answer']}\n"
+        "supporting_evidence:\n"
+        f"{evidence_lines}\n"
+        f"confidence: {confidence}\n"
+        "uncertainty_or_missing_evidence: "
+        f"{quality['report_quality_reason']}\n"
+        f"early_stop_triggered: {str(bool(early_stop_triggered)).lower()}\n"
+        f"low_quality_report: {str(quality['low_quality_report']).lower()}\n"
+        f"report_quality_reason: {quality['report_quality_reason']}\n"
+        "</report>"
+    )
 
 
 def _extract_report_or_sentinel(text):
@@ -357,6 +586,7 @@ class SubAgent:
         self._model_uses_reasoning = False
         self._searched_queries = []
         self._llm_calls_used = 0
+        self._tool_calls_used = 0
 
         if self.mode == 'api':
             self._setup_api()
@@ -447,12 +677,24 @@ class SubAgent:
         content = text.strip() if text else ""
         if not content:
             content = "(Sub-agent returned no output.)"
+        early_stop_triggered = status.startswith("early_stop")
+        if SEARCHSWARM_PATCH_REPORT_QUALITY and content != _NO_REPORT_SENTINEL:
+            content = _annotate_report_quality(
+                content, early_stop_triggered=early_stop_triggered)
+        quality = _report_quality(content) if SEARCHSWARM_PATCH_REPORT_QUALITY else {}
         return {
             "content": content,
             "messages": list(messages) if messages is not None else [],
             "queries": list(self._searched_queries),
             "llm_calls": self._llm_calls_used,
+            "tool_calls": getattr(self, "_tool_calls_used", 0),
+            "steps": self._llm_calls_used,
             "status": status,
+            "early_stop_triggered": early_stop_triggered,
+            "low_quality_report": quality.get("low_quality_report"),
+            "report_quality_reason": quality.get("report_quality_reason", ""),
+            "report_has_candidate": bool(quality.get("candidate_answer")),
+            "report_has_evidence": bool(quality.get("supporting_evidence")),
         }
 
     # -----------------------------------------------------------------
@@ -611,6 +853,7 @@ class SubAgent:
     def run(self, prompt, main_model=None, timeout_seconds=None):
         self._searched_queries = []
         self._llm_calls_used = 0
+        self._tool_calls_used = 0
         start_time = time.time()
         effective_timeout = (
             float(timeout_seconds)
@@ -662,7 +905,10 @@ class SubAgent:
             "messages": [],
             "queries": [],
             "llm_calls": 0,
+            "tool_calls": 0,
+            "steps": 0,
             "status": "error",
+            "early_stop_triggered": False,
         }
 
     # =================================================================
@@ -735,6 +981,7 @@ class SubAgent:
                     report, messages=messages, status='completed')
 
             for tc in tool_calls:
+                self._tool_calls_used = getattr(self, "_tool_calls_used", 0) + 1
                 tool_name = tc["function"]["name"]
                 try:
                     tool_args = json.loads(tc["function"]["arguments"])
@@ -770,6 +1017,13 @@ class SubAgent:
                         messages_before, client, model, is_api,
                         status='token_limit')
 
+            if _should_early_stop(self._llm_calls_used, SUB_AGENT_MAX_LLM_CALLS,
+                                  messages):
+                print("[SubAgent] Patch early-stop triggered; forcing report.")
+                return self._force_answer_structured(
+                    messages, client, model, is_api, status='early_stop',
+                    prompt=EARLY_STOP_FORCE_ANSWER_PROMPT)
+
             if num_calls <= 1 or remaining_seconds <= 45:
                 print("[SubAgent] Call limit approaching, forcing answer.")
                 return self._force_answer_structured(
@@ -778,8 +1032,9 @@ class SubAgent:
         last = messages[-1].get("content", "") if messages else ""
         return self._parse_result(last, messages=messages, status='max_calls')
 
-    def _force_answer_structured(self, messages, client, model, is_api, status='force_answer'):
-        _append_user_prompt(messages, FORCE_ANSWER_PROMPT)
+    def _force_answer_structured(self, messages, client, model, is_api,
+                                 status='force_answer', prompt=None):
+        _append_user_prompt(messages, prompt or FORCE_ANSWER_PROMPT)
 
         max_tokens = SUB_AGENT_MAX_GENERATION_TOKENS
         if not is_api:
@@ -896,6 +1151,8 @@ class SubAgent:
                     parsed_blocks = parse_tool_call_blocks(content)
                     results = []
                     for blk in parsed_blocks:
+                        self._tool_calls_used = (
+                            getattr(self, "_tool_calls_used", 0) + 1)
                         if blk['kind'] == 'python':
                             try:
                                 r = self._execute_tool('PythonInterpreter', {'code': blk['code']})
@@ -914,6 +1171,7 @@ class SubAgent:
                     messages.append({"role": "user", "content": combined})
                 else:
                     tool_call_str = content.split('<tool_call>')[1].split('</tool_call>')[0]
+                    self._tool_calls_used = getattr(self, "_tool_calls_used", 0) + 1
                     try:
                         tc = json5.loads(tool_call_str)
                         tool_name = tc.get('name', '')
@@ -951,6 +1209,13 @@ class SubAgent:
                 return self._force_answer_xml(
                     messages_before, client, model, status='token_limit')
 
+            if _should_early_stop(self._llm_calls_used, SUB_AGENT_MAX_LLM_CALLS,
+                                  messages):
+                print("[SubAgent] Patch early-stop triggered; forcing report.")
+                return self._force_answer_xml(
+                    messages, client, model, status='early_stop',
+                    prompt=EARLY_STOP_FORCE_ANSWER_PROMPT)
+
             if num_calls <= 1 or remaining_seconds <= 45:
                 print("[SubAgent] Call limit approaching, forcing answer.")
                 return self._force_answer_xml(messages, client, model, status='max_calls')
@@ -958,8 +1223,9 @@ class SubAgent:
         last = messages[-1].get("content", "") if messages else ""
         return self._parse_result(last, messages=messages, status='max_calls')
 
-    def _force_answer_xml(self, messages, client, model, status='force_answer'):
-        _append_user_prompt(messages, FORCE_ANSWER_PROMPT)
+    def _force_answer_xml(self, messages, client, model, status='force_answer',
+                          prompt=None):
+        _append_user_prompt(messages, prompt or FORCE_ANSWER_PROMPT)
 
         max_tokens = SUB_AGENT_MAX_GENERATION_TOKENS
         try:
@@ -1072,6 +1338,30 @@ class CallSubAgent(BaseTool):
         # itself AFTER constructing us. Keeping a reference would leak that
         # mutation into sub-agents' view, enabling recursive dispatch.
         self._tool_map = dict(tool_map) if tool_map else {}
+        self._brief_history = {}
+        self._brief_history_lock = threading.Lock()
+
+    def _filter_duplicate_entries(self, question, entries):
+        if not SEARCHSWARM_PATCH_DUPLICATE_FILTER:
+            return entries, []
+        key = question or "__unknown_question__"
+        accepted = []
+        skipped = []
+        with self._brief_history_lock:
+            previous = self._brief_history.setdefault(key, [])
+            for entry in entries:
+                prompt = entry.get("prompt", "")
+                is_dup, matched, score = _is_duplicate_brief(prompt, previous)
+                if is_dup:
+                    skipped.append({
+                        "entry": entry,
+                        "matched_prompt": matched,
+                        "similarity": round(score, 4),
+                    })
+                    continue
+                previous.append(prompt)
+                accepted.append(entry)
+        return accepted, skipped
 
     def call(self, params: Union[str, dict], **kwargs) -> str:
         from tool_search import ToolCallFormatError
@@ -1114,6 +1404,57 @@ class CallSubAgent(BaseTool):
 
         main_model = kwargs.get('model')
         question = kwargs.get('question', '')
+        original_entry_count = len(entries)
+        entries, skipped_duplicates = self._filter_duplicate_entries(
+            question, entries)
+        for skipped in skipped_duplicates:
+            entry = skipped["entry"]
+            similarity = skipped["similarity"]
+            message = (
+                "Sub-agent dispatch skipped by duplicate brief filter "
+                f"(similarity={similarity:.2f}). The main agent should "
+                "continue with existing evidence and avoid over-relying on "
+                "this skipped duplicate branch."
+            )
+            self._log_trajectory(question, entry, {
+                "content": (
+                    "<report>\n"
+                    f"candidate_answer: \n"
+                    "supporting_evidence:\n"
+                    f"- {message}\n"
+                    "confidence: low\n"
+                    "uncertainty_or_missing_evidence: duplicate brief skipped\n"
+                    "early_stop_triggered: false\n"
+                    "low_quality_report: true\n"
+                    "report_quality_reason: duplicate_subagent_brief\n"
+                    "</report>"
+                ),
+                "messages": [],
+                "queries": [],
+                "llm_calls": 0,
+                "tool_calls": 0,
+                "steps": 0,
+                "status": "skipped_duplicate",
+                "duration_ms": 0,
+                "duplicate_subagent_skipped": True,
+                "duplicate_similarity": similarity,
+                "duplicate_matched_prompt": skipped["matched_prompt"],
+                "brief_count_before_filter": original_entry_count,
+                "brief_count_after_filter": len(entries),
+                "low_quality_report": True,
+                "report_quality_reason": "duplicate_subagent_brief",
+                "report_has_candidate": False,
+                "report_has_evidence": False,
+                "early_stop_triggered": False,
+            })
+        if not entries:
+            return (
+                "All requested sub-agent briefs were skipped by the duplicate "
+                "brief filter. Continue final synthesis using existing "
+                "evidence; do not treat the skipped duplicate report as new "
+                "supporting evidence."
+            )
+
         child_timeout_seconds = SUB_AGENT_TIMEOUT_MINUTES * 60
         parent_deadline = kwargs.get('parent_deadline')
         if parent_deadline is not None:
@@ -1143,6 +1484,8 @@ class CallSubAgent(BaseTool):
                             "messages": [],
                             "queries": [],
                             "llm_calls": 0,
+                            "tool_calls": 0,
+                            "steps": 0,
                             "status": "skipped_due_to_parent_budget",
                             "duration_ms": 0,
                         })
@@ -1168,6 +1511,8 @@ class CallSubAgent(BaseTool):
                     "messages": [],
                     "queries": [],
                     "llm_calls": 0,
+                    "tool_calls": 0,
+                    "steps": 0,
                     "status": "error",
                     "duration_ms": 0,
                 }
@@ -1202,6 +1547,8 @@ class CallSubAgent(BaseTool):
                         "messages": [],
                         "queries": [],
                         "llm_calls": 0,
+                        "tool_calls": 0,
+                        "steps": 0,
                         "status": "error",
                         "duration_ms": 0,
                     }
@@ -1220,9 +1567,23 @@ class CallSubAgent(BaseTool):
             "messages": result.get("messages", []),
             "queries": result.get("queries", []),
             "llm_calls": result.get("llm_calls", 0),
+            "tool_calls": result.get("tool_calls", 0),
+            "steps": result.get("steps", result.get("llm_calls", 0)),
             "status": result.get("status", "unknown"),
             "duration_ms": result.get("duration_ms", 0),
             "content": result.get("content", ""),
+            "patch_enabled": SEARCHSWARM_PATCH_V1,
+            "early_stop_triggered": bool(result.get("early_stop_triggered")),
+            "low_quality_report": result.get("low_quality_report"),
+            "report_quality_reason": result.get("report_quality_reason", ""),
+            "report_has_candidate": bool(result.get("report_has_candidate")),
+            "report_has_evidence": bool(result.get("report_has_evidence")),
+            "duplicate_subagent_skipped": bool(
+                result.get("duplicate_subagent_skipped")),
+            "duplicate_similarity": result.get("duplicate_similarity"),
+            "duplicate_matched_prompt": result.get("duplicate_matched_prompt", ""),
+            "brief_count_before_filter": result.get("brief_count_before_filter"),
+            "brief_count_after_filter": result.get("brief_count_after_filter"),
         }
         _write_trajectory(record)
 
@@ -1264,7 +1625,18 @@ class CallSubAgent(BaseTool):
         for entry, result in zip(entries, results):
             goal = entry.get("goal", "").strip() or "(unspecified)"
             content = result.get("content", "").strip() or "(Sub-agent returned no output.)"
+            caution = ""
+            if (
+                SEARCHSWARM_PATCH_REPORT_QUALITY
+                and result.get("low_quality_report") is True
+            ):
+                reason = result.get("report_quality_reason") or "missing report quality evidence"
+                caution = (
+                    "\n\nPatch report-quality note: low_quality_report=true "
+                    f"({reason}). Treat this report as tentative and do not "
+                    "over-rely on it unless you can verify the evidence."
+                )
             parts.append(
-                f'A sub-agent dispatched for goal "{goal}" returned the following report:\n\n{content}'
+                f'A sub-agent dispatched for goal "{goal}" returned the following report:\n\n{content}{caution}'
             )
         return "\n\n---\n\n".join(parts)

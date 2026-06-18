@@ -1,6 +1,7 @@
 import json
 import os
 import random
+import re
 import time
 import datetime
 import threading
@@ -27,6 +28,7 @@ import main_checkpoint as _main_ckpt
 from tool_call_utils import normalize_tool_args
 from tool_search import *
 from tool_visit import *
+import patch_v2
 
 TOOL_TYPE = os.getenv('TOOL_TYPE', 'four')
 if TOOL_TYPE == 'four':
@@ -145,6 +147,38 @@ MAIN_FINAL_REPAIR_PROMPT = (
     "Observation:. Output only final answer text inside one <answer>...</answer> "
     "block."
 )
+
+
+def compact_final_answer_text(prediction):
+    """Keep benchmark predictions answer-shaped instead of explanation-shaped."""
+    text = "" if prediction is None else str(prediction).strip()
+    if not text:
+        return text
+    text = extract_answer_text(text) or text
+    text = text.strip()
+    based_match = re.search(
+        r"\b(?:the\s+)?answer\s+(?:is|would be)\s+(.+)$",
+        text,
+        flags=re.I | re.S,
+    )
+    if text.lower().startswith("based on") and based_match:
+        text = based_match.group(1).strip()
+    if "(" in text:
+        prefix = text.split("(", 1)[0].strip(" -:;,.")
+        if 1 <= len(prefix.split()) <= 10:
+            text = prefix
+    if "\n" in text:
+        first_line = next(
+            (line.strip() for line in text.splitlines() if line.strip()),
+            text,
+        )
+        if 1 <= len(first_line.split()) <= 14:
+            text = first_line
+    if len(text) > 140:
+        first_sentence = re.split(r"(?<=[.!?])\s+", text, maxsplit=1)[0].strip()
+        if first_sentence and len(first_sentence) <= 140:
+            text = first_sentence
+    return text.strip()
 
 
 BOOTSTRAP_SUB_AGENT_PROMPT_TEMPLATE = (
@@ -572,6 +606,21 @@ class MultiTurnReactAgent(FnCallAgent):
             msg["tool_calls"] = tool_calls
         return msg
 
+    def _normalize_tool_calls_for_history(self, tool_calls, round_num):
+        if not tool_calls:
+            return tool_calls
+        normalized = []
+        used = set()
+        for idx, tc in enumerate(tool_calls, 1):
+            item = deepcopy(tc)
+            call_id = item.get("id")
+            if not call_id or call_id in used:
+                call_id = f"synthetic_tool_call_{round_num}_{idx}"
+                item["id"] = call_id
+            used.add(call_id)
+            normalized.append(item)
+        return normalized
+
     def _log_reasoning_fallback(self, content, tool_calls, reasoning):
         try:
             with open("backstop.log", "a", encoding="utf-8") as f:
@@ -621,7 +670,10 @@ class MultiTurnReactAgent(FnCallAgent):
         prediction = "" if prediction is None else str(prediction)
         reasons = pseudo_tool_call_reasons(prediction)
         if not reasons:
-            return prediction, termination, messages
+            compacted = compact_final_answer_text(prediction)
+            if compacted != prediction:
+                termination = f"{termination}; compacted long final answer"
+            return compacted, termination, messages
 
         print(
             "[final_safety] Final prediction contains pseudo-tool-call text "
@@ -646,6 +698,138 @@ class MultiTurnReactAgent(FnCallAgent):
             f"{termination}; invalid tool-call-like final suppressed",
             repair_messages,
         )
+
+    def _patch_v2_begin_run(self, question):
+        self._patch_v2_question = question or ""
+        self._patch_v2_ledger = patch_v2.CandidateLedger(
+            enabled=patch_v2.PATCH_CANDIDATE_LEDGER)
+        self._patch_v2_router_stats = {
+            "adaptive_router_enabled": bool(patch_v2.PATCH_ADAPTIVE_ROUTER),
+            "router_decision_count": 0,
+            "router_skip_delegation_count": 0,
+            "router_allow_delegation_count": 0,
+            "router_force_diverse_brief_count": 0,
+            "router_stop_delegation_count": 0,
+            "router_reason": "",
+            "diverse_brief_generated_count": 0,
+            "duplicate_brief_rewritten_count": 0,
+            "brief_type_distribution": {},
+            "main_agent_early_finalize_count": 0,
+            "main_agent_early_finalize_reason": "",
+            "main_agent_steps_before_finalize": 0,
+        }
+        self._patch_v2_delegation_count = 0
+
+    def _patch_v2_ingest_message(self, message):
+        ledger = getattr(self, "_patch_v2_ledger", None)
+        if ledger is not None and patch_v2.PATCH_CANDIDATE_LEDGER:
+            ledger.add_message(message)
+
+    def _patch_v2_ingest_messages(self, messages):
+        ledger = getattr(self, "_patch_v2_ledger", None)
+        if ledger is not None and patch_v2.PATCH_CANDIDATE_LEDGER:
+            ledger.ingest_messages(messages or [])
+
+    def _patch_v2_result_fields(self):
+        if not (
+            patch_v2.PATCH_V2
+            or patch_v2.PATCH_FINAL_VERIFY
+            or patch_v2.PATCH_CANDIDATE_LEDGER
+            or patch_v2.PATCH_ADAPTIVE_ROUTER
+            or patch_v2.PATCH_MAIN_EARLY_FINALIZE
+        ):
+            return {}
+        ledger = getattr(self, "_patch_v2_ledger", None)
+        stats = ledger.stats() if ledger is not None else {
+            "candidate_ledger_enabled": bool(patch_v2.PATCH_CANDIDATE_LEDGER),
+            "candidate_count": 0,
+            "candidate_from_main_count": 0,
+            "candidate_from_subagent_count": 0,
+            "candidate_from_low_quality_report_count": 0,
+            "candidate_deduplicated_count": 0,
+        }
+        router_stats = getattr(self, "_patch_v2_router_stats", {})
+        fields = {
+            "patch_v2_enabled": bool(patch_v2.PATCH_V2),
+            **stats,
+            **router_stats,
+        }
+        verifier = getattr(self, "_patch_v2_last_verifier", None)
+        fields.update(patch_v2.verifier_stats(verifier) if patch_v2.PATCH_FINAL_VERIFY else {
+            "final_verifier_used_count": 0,
+            "final_verifier_changed_answer_count": 0,
+            "final_verifier_kept_answer_count": 0,
+            "final_verifier_rejected_candidate_count": 0,
+            "final_verifier_low_confidence_count": 0,
+            "final_verifier_empty_or_failed_count": 0,
+        })
+        if verifier:
+            fields.update({
+                "final_verifier_selected_candidate": verifier.get("selected_candidate", ""),
+                "final_verifier_rejected_candidates": [
+                    item.get("candidate")
+                    for item in verifier.get("rejected_candidates", [])
+                ],
+                "final_verifier_confidence": verifier.get("confidence", ""),
+                "final_verifier_changed_answer": bool(
+                    verifier.get("verifier_changed_answer")),
+                "final_verifier_reason": verifier.get("verification_reason", ""),
+            })
+        return fields
+
+    def _patch_v2_verify_prediction(self, question, prediction, messages):
+        if not patch_v2.PATCH_FINAL_VERIFY:
+            return prediction, None
+        ledger = getattr(self, "_patch_v2_ledger", None)
+        if ledger is None:
+            ledger = patch_v2.ledger_from_messages(messages or [])
+            self._patch_v2_ledger = ledger
+        else:
+            ledger.ingest_messages((messages or [])[-12:])
+        verifier = patch_v2.verify_final_answer(
+            question, prediction, ledger, messages=(messages or [])[-12:])
+        self._patch_v2_last_verifier = verifier
+        selected = verifier.get("selected_candidate") or prediction
+        return selected, verifier
+
+    def _patch_v2_route_tool_call(self, tool_name, tool_args):
+        if tool_name != "call_sub_agent" or not patch_v2.PATCH_ADAPTIVE_ROUTER:
+            return True, tool_args, ""
+        stats = getattr(self, "_patch_v2_router_stats", None)
+        if stats is None:
+            self._patch_v2_begin_run(getattr(self, "_patch_v2_question", ""))
+            stats = self._patch_v2_router_stats
+        decision = patch_v2.route_delegation(
+            getattr(self, "_patch_v2_question", ""),
+            tool_args,
+            ledger=getattr(self, "_patch_v2_ledger", None),
+            previous_delegations=getattr(self, "_patch_v2_delegation_count", 0),
+        )
+        stats["router_decision_count"] += 1
+        stats["router_reason"] = decision.get("reason", "")
+        if decision.get("allow"):
+            stats["router_allow_delegation_count"] += 1
+            brief_types = decision.get("brief_types") or []
+            stats["diverse_brief_generated_count"] += len(brief_types)
+            if decision.get("force_diverse"):
+                stats["router_force_diverse_brief_count"] += 1
+                stats["duplicate_brief_rewritten_count"] += 1
+            dist = stats.setdefault("brief_type_distribution", {})
+            for brief_type in brief_types:
+                dist[brief_type] = dist.get(brief_type, 0) + 1
+            self._patch_v2_delegation_count = (
+                getattr(self, "_patch_v2_delegation_count", 0) + 1)
+            return True, decision.get("params", tool_args), ""
+        if decision.get("stop_delegation"):
+            stats["router_stop_delegation_count"] += 1
+        else:
+            stats["router_skip_delegation_count"] += 1
+        message = (
+            "Adaptive router skipped sub-agent delegation: "
+            f"{decision.get('reason', 'no reason')}. Continue with existing "
+            "evidence and final verification."
+        )
+        return False, tool_args, message
 
     def _bootstrap_required_sub_agent(self, question, messages, start_time,
                                       model):
@@ -796,6 +980,16 @@ class MultiTurnReactAgent(FnCallAgent):
                 cur_messages,
                 planning_port=data.get("planning_port"),
             )
+            prediction, verifier = self._patch_v2_verify_prediction(
+                question, prediction, cur_messages)
+            if verifier and verifier.get("verifier_changed_answer"):
+                termination = f"{termination}; final verifier changed answer"
+            prediction, termination, cur_messages = self._sanitize_final_prediction(
+                prediction,
+                termination,
+                cur_messages,
+                planning_port=data.get("planning_port"),
+            )
             result = {
                 "question": question,
                 "answer": answer,
@@ -803,6 +997,7 @@ class MultiTurnReactAgent(FnCallAgent):
                 "prediction": prediction,
                 "termination": termination,
             }
+            result.update(self._patch_v2_result_fields())
             if checkpoint_enabled:
                 _main_ckpt.write_completed(
                     checkpoint_path,
@@ -850,6 +1045,7 @@ class MultiTurnReactAgent(FnCallAgent):
             except Exception:
                 question = ''
         answer = item.get('answer') or item.get('ground_truth') or ''
+        self._patch_v2_begin_run(question)
 
         start_time = time.time()
         planning_port = data['planning_port']
@@ -1018,6 +1214,7 @@ class MultiTurnReactAgent(FnCallAgent):
             except Exception:
                 question = ''
         answer = item.get('answer') or item.get('ground_truth') or ''
+        self._patch_v2_begin_run(question)
 
         start_time = time.time()
         planning_port = data['planning_port']
@@ -1182,6 +1379,7 @@ class MultiTurnReactAgent(FnCallAgent):
             except Exception:
                 question = ''
         answer = item.get('answer') or item.get('ground_truth') or ''
+        self._patch_v2_begin_run(question)
 
         start_time = time.time()
         system_prompt = render_main_system_prompt(today_date(), include_tools=False)
@@ -1202,6 +1400,7 @@ class MultiTurnReactAgent(FnCallAgent):
             return completed_result
         messages = self._bootstrap_required_sub_agent(
             question, messages, start_time, self.model)
+        self._patch_v2_ingest_messages(messages)
         save_running(
             "start_or_resume", messages, round_num,
             num_llm_calls_available, format_retry_count, start_time)
@@ -1309,7 +1508,15 @@ class MultiTurnReactAgent(FnCallAgent):
                         messages, round_num, num_llm_calls_available,
                         format_retry_count, start_time)
 
-            messages.append(self._make_assistant_msg(content, tool_calls=tool_calls, reasoning=reasoning))
+            tool_calls = self._normalize_tool_calls_for_history(
+                tool_calls, round_num)
+            assistant_content = content
+            if tool_calls and contains_pseudo_tool_call(assistant_content):
+                assistant_content = ""
+            assistant_msg = self._make_assistant_msg(
+                assistant_content, tool_calls=tool_calls, reasoning=reasoning)
+            messages.append(assistant_msg)
+            self._patch_v2_ingest_message(assistant_msg)
 
             if not tool_calls:
                 final_text = content or reasoning or ""
@@ -1373,12 +1580,62 @@ class MultiTurnReactAgent(FnCallAgent):
                     except Exception as e:
                         result = f"[Tool Error] {tool_name}: {type(e).__name__}: {e!r}. Arguments received: {json.dumps(tool_args, ensure_ascii=False, default=str)[:500]}"
 
-                messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+                tool_msg = {"role": "tool", "tool_call_id": tc["id"], "content": result}
+                messages.append(tool_msg)
+                self._patch_v2_ingest_message(tool_msg)
 
             if format_error_in_round:
                 continue
 
             format_retry_count = 0
+
+            if (
+                patch_v2.PATCH_V2
+                and not _main_ckpt.messages_safe_for_resume(messages)
+            ):
+                print(
+                    "[patch_v2] Unsafe tool-call history after round; "
+                    "finalizing from ledger instead of sending invalid "
+                    "messages back to the API."
+                )
+                ledger = getattr(self, "_patch_v2_ledger", None)
+                verifier = patch_v2.verify_final_answer(
+                    question, "", ledger, messages=messages[-12:])
+                self._patch_v2_last_verifier = verifier
+                prediction = verifier.get("selected_candidate") or "No answer found."
+                return finish(
+                    prediction,
+                    "answer (patch v2 unsafe history early finalize)",
+                    "patch_v2_unsafe_history_finalize",
+                    messages,
+                    round_num,
+                    num_llm_calls_available,
+                    format_retry_count,
+                    start_time)
+
+            early = patch_v2.should_main_early_finalize(
+                question,
+                getattr(self, "_patch_v2_ledger", None),
+                round_num,
+                MAX_LLM_CALL_PER_RUN,
+            )
+            if early.get("trigger"):
+                stats = getattr(self, "_patch_v2_router_stats", {})
+                stats["main_agent_early_finalize_count"] = (
+                    stats.get("main_agent_early_finalize_count", 0) + 1)
+                stats["main_agent_early_finalize_reason"] = early.get("reason", "")
+                stats["main_agent_steps_before_finalize"] = round_num
+                prediction = early["verifier"].get("selected_candidate", "")
+                self._patch_v2_last_verifier = early["verifier"]
+                return finish(
+                    prediction,
+                    "answer (patch v2 main-agent early finalize)",
+                    "patch_v2_main_early_finalize",
+                    messages,
+                    round_num,
+                    num_llm_calls_available,
+                    format_retry_count,
+                    start_time)
 
             if use_api_token_counter and num_llm_calls_available <= 1:
                 print(
@@ -1487,6 +1744,11 @@ class MultiTurnReactAgent(FnCallAgent):
     def custom_call_tool(self, tool_name: str, tool_args: dict, **kwargs):
         if tool_name in TOOL_MAP:
             tool_args = normalize_tool_args(tool_args)
+            allow, routed_args, skip_message = self._patch_v2_route_tool_call(
+                tool_name, tool_args)
+            if not allow:
+                return skip_message
+            tool_args = routed_args
             raw_result = TOOL_MAP[tool_name].call(tool_args, **kwargs)
             return raw_result
         else:

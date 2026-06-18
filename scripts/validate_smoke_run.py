@@ -43,6 +43,146 @@ def _usable_subagent_trajectory(record, allow_fallback=False):
     )
 
 
+def build_subagent_patch_summary(trajectory_records):
+    statuses = [
+        str(record.get("status") or "").strip().lower()
+        for record in trajectory_records
+        if isinstance(record, dict)
+    ]
+    numeric_steps = [
+        float(record.get("steps", record.get("llm_calls", 0)) or 0)
+        for record in trajectory_records
+        if isinstance(record, dict)
+    ]
+    numeric_tool_calls = [
+        float(record.get("tool_calls", 0) or 0)
+        for record in trajectory_records
+        if isinstance(record, dict)
+    ]
+    duplicate_pairs = []
+    for record in trajectory_records:
+        if not isinstance(record, dict):
+            continue
+        if record.get("duplicate_subagent_skipped"):
+            duplicate_pairs.append({
+                "prompt": record.get("prompt", ""),
+                "matched_prompt": record.get("duplicate_matched_prompt", ""),
+                "similarity": record.get("duplicate_similarity"),
+            })
+    return {
+        "patch_enabled": any(
+            bool(record.get("patch_enabled"))
+            for record in trajectory_records
+            if isinstance(record, dict)
+        ),
+        "subagent_early_stop_count": sum(
+            1 for record in trajectory_records
+            if isinstance(record, dict) and record.get("early_stop_triggered")
+        ),
+        "avg_subagent_steps": (
+            round(sum(numeric_steps) / len(numeric_steps), 2)
+            if numeric_steps else 0
+        ),
+        "avg_subagent_tool_calls": (
+            round(sum(numeric_tool_calls) / len(numeric_tool_calls), 2)
+            if numeric_tool_calls else 0
+        ),
+        "subagent_completed_count": statuses.count("completed"),
+        "subagent_fallback_count": sum(
+            1 for status in statuses if status.endswith("_fallback")
+        ),
+        "subagent_max_calls_count": sum(
+            1 for status in statuses if status.startswith("max_calls")
+        ),
+        "duplicate_subagent_skipped_count": sum(
+            1 for record in trajectory_records
+            if isinstance(record, dict) and record.get("duplicate_subagent_skipped")
+        ),
+        "duplicate_subagent_brief_pairs": duplicate_pairs,
+        "subagent_brief_count_before_filter": sum(
+            int(record.get("brief_count_before_filter") or 0)
+            for record in trajectory_records
+            if isinstance(record, dict)
+            and record.get("duplicate_subagent_skipped")
+        ),
+        "subagent_brief_count_after_filter": sum(
+            int(record.get("brief_count_after_filter") or 0)
+            for record in trajectory_records
+            if isinstance(record, dict)
+            and record.get("duplicate_subagent_skipped")
+        ),
+        "low_quality_report_count": sum(
+            1 for record in trajectory_records
+            if isinstance(record, dict) and record.get("low_quality_report") is True
+        ),
+        "high_quality_report_count": sum(
+            1 for record in trajectory_records
+            if isinstance(record, dict) and record.get("low_quality_report") is False
+        ),
+        "report_with_candidate_count": sum(
+            1 for record in trajectory_records
+            if isinstance(record, dict) and record.get("report_has_candidate")
+        ),
+        "report_with_evidence_count": sum(
+            1 for record in trajectory_records
+            if isinstance(record, dict) and record.get("report_has_evidence")
+        ),
+    }
+
+
+def build_patch_v2_result_summary(records):
+    result_records = [
+        record for record in records
+        if isinstance(record, dict)
+    ]
+
+    def sum_int(key):
+        return sum(int(record.get(key) or 0) for record in result_records)
+
+    return {
+        "patch_v2_enabled": any(
+            bool(record.get("patch_v2_enabled"))
+            for record in result_records
+        ),
+        "candidate_ledger_enabled": any(
+            bool(record.get("candidate_ledger_enabled"))
+            for record in result_records
+        ),
+        "candidate_count": sum_int("candidate_count"),
+        "candidate_from_main_count": sum_int("candidate_from_main_count"),
+        "candidate_from_subagent_count": sum_int("candidate_from_subagent_count"),
+        "candidate_from_low_quality_report_count": sum_int(
+            "candidate_from_low_quality_report_count"),
+        "candidate_deduplicated_count": sum_int("candidate_deduplicated_count"),
+        "final_verifier_used_count": sum_int("final_verifier_used_count"),
+        "final_verifier_changed_answer_count": sum_int(
+            "final_verifier_changed_answer_count"),
+        "final_verifier_kept_answer_count": sum_int(
+            "final_verifier_kept_answer_count"),
+        "final_verifier_rejected_candidate_count": sum_int(
+            "final_verifier_rejected_candidate_count"),
+        "final_verifier_low_confidence_count": sum_int(
+            "final_verifier_low_confidence_count"),
+        "final_verifier_empty_or_failed_count": sum_int(
+            "final_verifier_empty_or_failed_count"),
+        "adaptive_router_enabled": any(
+            bool(record.get("adaptive_router_enabled"))
+            for record in result_records
+        ),
+        "router_decision_count": sum_int("router_decision_count"),
+        "router_skip_delegation_count": sum_int("router_skip_delegation_count"),
+        "router_allow_delegation_count": sum_int("router_allow_delegation_count"),
+        "router_force_diverse_brief_count": sum_int(
+            "router_force_diverse_brief_count"),
+        "router_stop_delegation_count": sum_int("router_stop_delegation_count"),
+        "diverse_brief_generated_count": sum_int("diverse_brief_generated_count"),
+        "duplicate_brief_rewritten_count": sum_int(
+            "duplicate_brief_rewritten_count"),
+        "main_agent_early_finalize_count": sum_int(
+            "main_agent_early_finalize_count"),
+    }
+
+
 def build_validation_summary(records, trajectory_records, run_exit_code=None,
                              validation_status="unknown",
                              validation_executed=True):
@@ -56,7 +196,7 @@ def build_validation_summary(records, trajectory_records, run_exit_code=None,
         for record in trajectory_records
         if isinstance(record, dict)
     ]
-    return {
+    summary = {
         "run_success": run_exit_code == 0 if run_exit_code is not None else None,
         "run_exit_code": run_exit_code,
         "validation_status": validation_status,
@@ -96,6 +236,9 @@ def build_validation_summary(records, trajectory_records, run_exit_code=None,
             1 for status in statuses if status.startswith("max_calls")
         ),
     }
+    summary.update(build_subagent_patch_summary(trajectory_records))
+    summary.update(build_patch_v2_result_summary(records))
+    return summary
 
 
 def validate_smoke_run(result_path, trajectory_path, setting,
